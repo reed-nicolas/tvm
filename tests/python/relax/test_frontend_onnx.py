@@ -363,6 +363,34 @@ def test_binary(op_name: str):
     verify_binary_scalar(op_name)
 
 
+@pytest.mark.parametrize("op_name", ["Add", "Sub", "Mul", "Div"])
+def test_binary_primvalue_broadcast_to_array(op_name):
+    """A scalar ``PrimValue`` operand combined with a constant *array* must fold to a Constant
+    tensor, not crash. numpy broadcasting produces a non-scalar ndarray which ``relax.PrimValue``
+    cannot wrap ("Don't know how to handle type numpy.ndarray"); the frontend must emit a Constant
+    in that case. Regression for the BinaryBase PrimValue fast-path."""
+    import numpy as np
+    import tvm
+    from tvm import relax, tir
+    from tvm.relax.frontend.onnx.onnx_frontend import (
+        Add as _Add,
+        Sub as _Sub,
+        Mul as _Mul,
+        Div as _Div,
+    )
+
+    conv = {"Add": _Add, "Sub": _Sub, "Mul": _Mul, "Div": _Div}[op_name]
+    scalar = relax.PrimValue(tir.IntImm("int64", 3))
+    arr = relax.const(np.array([1.0, 2.0, 3.0, 4.0], dtype="float32"))
+    out = conv.base_impl(None, [scalar, arr], {}, [{}, {}])
+    assert isinstance(out, relax.Constant), f"{op_name}: expected folded Constant, got {type(out)}"
+    got = out.data.numpy()
+    ref = {"Add": np.add, "Sub": np.subtract, "Mul": np.multiply, "Div": np.divide}[op_name](
+        np.array(3), np.array([1.0, 2.0, 3.0, 4.0], dtype="float32")
+    )
+    np.testing.assert_allclose(got, ref, rtol=1e-6)
+
+
 @pytest.mark.parametrize("int_mode", [True, False])
 def test_mod(int_mode: bool):
     if int_mode:

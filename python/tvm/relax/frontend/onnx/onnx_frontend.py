@@ -343,7 +343,15 @@ class BinaryBase(OnnxOpConverter):
         if any([isinstance(inp, relax.PrimValue) for inp in inputs]):
             x = _to_numpy(inputs[0])
             y = _to_numpy(inputs[1])
-            return relax.PrimValue(cls.numpy_op(x, y))  # pylint: disable=not-callable
+            result = cls.numpy_op(x, y)  # pylint: disable=not-callable
+            # The PrimValue fast-path is for scalar shape arithmetic. numpy broadcasting can produce
+            # a non-scalar array (e.g. a PrimValue scalar combined with a folded constant tensor);
+            # ``relax.PrimValue`` only wraps a scalar, so emit a Constant tensor in that case instead
+            # of crashing in the FFI with "Don't know how to handle type numpy.ndarray".
+            arr = _np.asarray(result)
+            if arr.ndim == 0:
+                return relax.PrimValue(arr.item())
+            return relax.const(arr)
 
         return cls.relax_op(inputs[0], inputs[1])  # pylint: disable=not-callable
 
