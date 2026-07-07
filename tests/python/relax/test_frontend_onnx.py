@@ -1565,6 +1565,82 @@ def test_all_reduce_funcs(func, dynamic):
         )
 
 
+@pytest.mark.parametrize("func, dynamic", create_reduce_test_parameters())
+def test_all_reduce_funcs_opset18(func, dynamic):
+    """Opset-18 reducers take ``axes`` as an optional *input* (a constant int64 tensor), not an
+    attribute. Regression test for the frontend reducing over ALL axes when it silently missed the
+    axes input (broke e.g. per-token RMSNorm ``ReduceMean(axis=-1)`` -> full reduction)."""
+
+    def verify_reduce_func_v18(func, data, axis, keepdims, noop_with_empty_axes=0):
+        inshape = data.shape
+        if axis is None:
+            if noop_with_empty_axes:
+                outshape = inshape
+            else:
+                outshape = np.sum(data, axis=None, keepdims=keepdims == 1).shape
+        else:
+            outshape = np.sum(data, axis=tuple(axis), keepdims=keepdims == 1).shape
+
+        node_inputs = ["x"]
+        initializer = []
+        if axis is not None:
+            node_inputs.append("axes")
+            initializer.append(
+                helper.make_tensor("axes", TensorProto.INT64, [len(axis)], list(axis))
+            )
+        node = onnx.helper.make_node(
+            func,
+            inputs=node_inputs,
+            outputs=["y"],
+            keepdims=keepdims,
+            noop_with_empty_axes=noop_with_empty_axes,
+        )
+
+        if dynamic:
+            in_list = ["?" for _ in range(len(inshape))]
+            out_list = ["?" for _ in range(len(outshape))]
+        else:
+            in_list = list(inshape)
+            out_list = list(outshape)
+        graph = helper.make_graph(
+            [node],
+            "reduce_test_v18",
+            inputs=[helper.make_tensor_value_info("x", TensorProto.FLOAT, in_list)],
+            outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, out_list)],
+            initializer=initializer,
+        )
+        model = helper.make_model(graph, producer_name="reduce_test_v18")
+        check_correctness(model, {"x": data}, opset=18, rtol=1e-4, atol=1e-4)
+
+    for keepdims in [True, False]:
+        # the exact RMSNorm shape/axis that regressed: reduce only the last axis. torch exports this
+        # with axis=-1; for the static-shape case we keep -1 (a negative axis is what regressed).
+        # (Negative axes on a *dynamic*-rank input are a separate, pre-existing frontend limitation
+        # shared by ReduceSum, so the dynamic probes below use the equivalent positive axis.)
+        last_axis = (2,) if dynamic else (-1,)
+        verify_reduce_func_v18(
+            func, np.random.randn(1, 8, 16).astype(np.float32), axis=last_axis, keepdims=keepdims
+        )
+        verify_reduce_func_v18(
+            func, np.random.randn(3, 3, 3).astype(np.float32), axis=(1,), keepdims=keepdims
+        )
+        verify_reduce_func_v18(
+            func, np.random.randn(3, 3, 3).astype(np.float32), axis=(1, 2), keepdims=keepdims
+        )
+        # axes omitted -> reduce over all axes (default noop_with_empty_axes=0)
+        verify_reduce_func_v18(
+            func, np.random.randn(3, 2, 2).astype(np.float32), axis=None, keepdims=keepdims
+        )
+        # axes omitted + noop_with_empty_axes=1 -> identity (no reduction)
+        verify_reduce_func_v18(
+            func,
+            np.random.randn(3, 2, 2).astype(np.float32),
+            axis=None,
+            keepdims=keepdims,
+            noop_with_empty_axes=1,
+        )
+
+
 @pytest.mark.parametrize("in_dtype", [np.float32, np.int32])
 @pytest.mark.parametrize("axis", [None, 0, 1, 2])
 @pytest.mark.parametrize("keepdims", [None, True, False])
