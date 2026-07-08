@@ -785,8 +785,32 @@ class Gather(OnnxOpConverter):
             if len(np_index.shape) == 1:
                 np_index = np_index[0]
             np_index = int(np_index)
+            if np_index < 0:  # ONNX Gather allows negative indices (count from the back)
+                np_index += len(data)
             shape_val = data[np_index]
             return relax.PrimValue(shape_val)
+
+        # ONNX Gather permits NEGATIVE indices (counting from the back of ``axis``); ``relax.op.take``
+        # does not wrap them and would read out of bounds (garbage). Normalize against the static
+        # axis length: ``idx < 0 -> idx + dim``. (relax.op.take has no clip/wrap mode.)
+        try:
+            dim = int(data.struct_info.shape[axis])
+        except Exception:  # noqa: BLE001 - dynamic axis dim; leave indices as-is
+            dim = None
+        if dim is not None:
+            if isinstance(indices, relax.Constant):
+                np_idx = indices.data.numpy()
+                if (np_idx < 0).any():
+                    indices = relax.const(_np.where(np_idx < 0, np_idx + dim, np_idx), np_idx.dtype)
+            else:
+                # Use the indices' own dtype for the constants so the arithmetic type-checks (some
+                # exported graphs carry non-int64 index tensors).
+                idx_dt = indices.struct_info.dtype
+                zero = relax.const(_np.array(0, idx_dt), idx_dt)
+                dimc = relax.const(_np.array(dim, idx_dt), idx_dt)
+                indices = relax.op.where(
+                    relax.op.less(indices, zero), relax.op.add(indices, dimc), indices
+                )
 
         return relax.op.take(data, indices, axis)
 
@@ -846,19 +870,33 @@ class ScatterND(OnnxOpConverter):
 
         return reduction
 
+    @staticmethod
+    def _match_updates_dtype(data, updates):
+        """relax.op.scatter_nd requires data and updates to share a dtype; an exported graph can
+        carry mismatched updates (e.g. a Slice of int64 position ids scattered into an f32 buffer).
+        The ONNX output dtype is data's, so cast updates to data's dtype (matches onnxruntime)."""
+        d_dt = data.struct_info.dtype
+        u_dt = getattr(updates.struct_info, "dtype", d_dt)
+        if u_dt != d_dt:
+            updates = relax.op.astype(updates, d_dt)
+        return updates
+
     @classmethod
     def _impl_v11(cls, bb, inputs, attr, params):
-        return relax.op.scatter_nd(inputs[0], inputs[1], inputs[2])
+        updates = cls._match_updates_dtype(inputs[0], inputs[2])
+        return relax.op.scatter_nd(inputs[0], inputs[1], updates)
 
     @classmethod
     def _impl_v16(cls, bb, inputs, attr, params):
         reduction = cls._reduction_check(attr, ["update", "add", "mul"])
-        return relax.op.scatter_nd(inputs[0], inputs[1], inputs[2], reduction)
+        updates = cls._match_updates_dtype(inputs[0], inputs[2])
+        return relax.op.scatter_nd(inputs[0], inputs[1], updates, reduction)
 
     @classmethod
     def _impl_v18(cls, bb, inputs, attr, params):
         reduction = cls._reduction_check(attr, ["update", "add", "mul", "min", "max"])
-        return relax.op.scatter_nd(inputs[0], inputs[1], inputs[2], reduction)
+        updates = cls._match_updates_dtype(inputs[0], inputs[2])
+        return relax.op.scatter_nd(inputs[0], inputs[1], updates, reduction)
 
 
 class Compress(OnnxOpConverter):

@@ -570,6 +570,11 @@ def test_gather():
     _verify_gather([5, 4, 3, 2], [0, 1, 3], [3, 4, 3, 2])
     _verify_gather([3], 0, [])
     _verify_gather([3, 3], [[0, 2]], [3, 1, 2], 1)
+    # ONNX Gather permits NEGATIVE indices (count from the back); relax.op.take does not wrap them
+    # and would read out of bounds. Regression for the negative-index normalization.
+    _verify_gather([3], -1, [])
+    _verify_gather([5, 4, 3, 2], [-1, 0, -2], [3, 4, 3, 2])
+    _verify_gather([1, 1, 32, 32], -1, [1, 1, 32], 2)  # the bitvla attention-mask gather shape
 
 
 @pytest.mark.parametrize(
