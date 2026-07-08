@@ -1471,7 +1471,11 @@ class ConstantOfShape(OnnxOpConverter):
         if not isinstance(shape, relax.ShapeExpr):
             shape = relax.op.tensor_to_shape(shape)
 
-        return relax.op.broadcast_to(relax.const(value, dtype), shape)
+        # The fill ``value`` is a 1-element tensor (ndim 1); broadcasting it to a target that is a
+        # scalar (ndim 0, e.g. ConstantOfShape with an empty ``shape``) fails "ndim 1 vs target ndim
+        # 0". Use a 0-d SCALAR fill so it broadcasts to ANY target rank (incl. rank 0).
+        scalar = _np.asarray(value).reshape(()).astype(dtype)
+        return relax.op.broadcast_to(relax.const(scalar, dtype), shape)
 
 
 class Sin(OnnxOpConverter):
@@ -1966,19 +1970,22 @@ class Expand(OnnxOpConverter):
 
         # If possible, directly expand to constant shape.
         if isinstance(shape, relax.Constant):
-            new_shape = shape.data.numpy().tolist()
-            # For some reason, onnx allows target shapes to be smaller than input shapes.
-            # We need to go correct it.
+            tgt = shape.data.numpy().tolist()
             data_shape = [dim.value for dim in data.struct_info.shape]
-            # Dimensions are right alignment.
-            data_shape = [1] * (len(new_shape) - len(data_shape)) + data_shape
-            # Fix small target shapes.
-            for i, s in enumerate(new_shape):
-                if i < len(data_shape) and s < data_shape[i]:
-                    new_shape[i] = data_shape[i]
-            # If the new shape matches the input shape, no transformation is needed.
-            if new_shape == data_shape:
-                return data
+            # ONNX Expand is TWO-WAY broadcasting: the output rank is max(data rank, target rank),
+            # so a *shorter* (lower-rank) target must NOT reduce the output rank — the leading data
+            # dims are kept. (A target of [] expanding a [1] tensor stays [1], not a rank-0 scalar,
+            # which would make broadcast_to fail "ndim 1 vs target ndim 0".) Right-align both and
+            # take the elementwise max (target -1 / 0 / smaller keeps the data dim).
+            rank = max(len(tgt), len(data_shape))
+            tgt_a = [1] * (rank - len(tgt)) + list(tgt)
+            data_a = [1] * (rank - len(data_shape)) + list(data_shape)
+            new_shape = []
+            for t, d in zip(tgt_a, data_a):
+                new_shape.append(d if (t == -1 or t < d) else t)
+            if new_shape == data_a:
+                return data if rank == len(data_shape) else relax.op.broadcast_to(
+                    data, relax.ShapeExpr(new_shape))
             return relax.op.broadcast_to(data, relax.ShapeExpr(new_shape))
 
         # Otherwise handle dynamic shapes.
