@@ -790,6 +790,14 @@ class Gather(OnnxOpConverter):
             shape_val = data[np_index]
             return relax.PrimValue(shape_val)
 
+        # ``relax.op.take`` requires integer indices; an exported graph can carry a float index
+        # tensor (onnxruntime casts it). Cast non-integer indices to int64 first. Normalize through
+        # the block builder so struct_info is populated before we inspect it below.
+        idx_dt = str(getattr(indices.struct_info, "dtype", "int64"))
+        if "int" not in idx_dt:
+            indices = bb.normalize(relax.op.astype(indices, "int64"))
+            idx_dt = "int64"
+
         # ONNX Gather permits NEGATIVE indices (counting from the back of ``axis``); ``relax.op.take``
         # does not wrap them and would read out of bounds (garbage). Normalize against the static
         # axis length: ``idx < 0 -> idx + dim``. (relax.op.take has no clip/wrap mode.)
@@ -803,13 +811,11 @@ class Gather(OnnxOpConverter):
                 if (np_idx < 0).any():
                     indices = relax.const(_np.where(np_idx < 0, np_idx + dim, np_idx), np_idx.dtype)
             else:
-                # Use the indices' own dtype for the constants so the arithmetic type-checks (some
-                # exported graphs carry non-int64 index tensors).
-                idx_dt = indices.struct_info.dtype
                 zero = relax.const(_np.array(0, idx_dt), idx_dt)
                 dimc = relax.const(_np.array(dim, idx_dt), idx_dt)
-                indices = relax.op.where(
-                    relax.op.less(indices, zero), relax.op.add(indices, dimc), indices
+                indices = bb.normalize(
+                    relax.op.where(relax.op.less(indices, zero),
+                                   relax.op.add(indices, dimc), indices)
                 )
 
         return relax.op.take(data, indices, axis)
