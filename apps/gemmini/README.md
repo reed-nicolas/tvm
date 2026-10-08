@@ -19,7 +19,7 @@ under the License.
 
 # Gemmini integration organization
 
-Work belongs on `gemmini/bringup`. The isolated host compiler/runtime build and ten synthetic PyTorch → ONNX → Relax CPU checks are verified; no Gemmini backend is registered and no full model has been run. The source locations below are planned and unimplemented.
+Work belongs on `gemmini/bringup`. The isolated host compiler/runtime build and twenty synthetic frontend CPU checks are verified; no Gemmini backend is registered and no full model has been run. The source locations below are planned and unimplemented.
 
 | Future location | Integration responsibility |
 | --- | --- |
@@ -33,7 +33,9 @@ Work belongs on `gemmini/bringup`. The isolated host compiler/runtime build and 
 
 The host recipe opts into `USE_HOST_ONLY_AUTO_COPY_GUARD` (OFF by default) because this checkout lacks the `LowerAutoCopy` implementation required by existing driver/MetaSchedule callers. `auto_copy_guard.cc` preserves unannotated IR and rejects automatic-copy markers; it is a validation-only pass, supplies no optimization, and must not coexist with the full implementation. The host verifier checks preservation and rejection through direct calls and ordinary `tvm.build`; record this local patch and enabled mode with the base commit.
 
-`verify_onnx.py --output-dir DIR` checks matmul, batched matmul, convolution, LayerNorm and RMSNorm at opsets 17 and 18 against PyTorch and ONNX ReferenceEvaluator. It retains graphs, imported IR, arrays and dependency/library provenance. Optional `--case`, `--opset` and `--importer-source` narrow checks or isolate a historical Python importer on the current runtime. The original v0.19 importer fails the opset-18 RMSNorm case numerically; the inherited reduction-axis fix corrects it. These cases do not exercise all inherited patches or qualify model/device behavior.
+`verify_onnx.py --output-dir DIR` checks matmul, batched matmul, convolution, LayerNorm and RMSNorm at opsets 17 and 18 against PyTorch and ONNX ReferenceEvaluator. `--suite importer` instead checks shape arithmetic, constant/runtime negative Gather indices, lower-rank Expand and scalar ConstantOfShape against independent NumPy expectations. Integer outputs require exact equality, including an int64 value beyond the int32 range. Both suites retain graphs, imported IR, arrays and dependency/library provenance.
+
+Optional `--case`, `--opset` and `--importer-source` narrow checks or isolate a historical Python importer on the current runtime. Historical negative-Gather overrides retain imported IR but do not execute potentially unchecked indices; their status is `not_executed`, never a pass. The original v0.19 importer fails the opset-18 RMSNorm case numerically and fails the shape-array, lower-rank Expand and scalar ConstantOfShape cases during import. A local follow-up preserves the NumPy dtype when folding shape arithmetic, preventing the inherited binary fix from silently narrowing int64 output. These cases do not exercise every inherited change or qualify model/device behavior.
 
 The selected backend route calls the Gemmini C operator library, following the comparison team's fairness guidance. Preserve shapes, layouts, quantization scales, rounding and output semantics; make supported shapes/layouts, argument contracts, numerical rules, workspace requirements and instruction policy explicit. The handwritten compiler remains a separate reference, and its zero hardware-loop policy does not automatically apply to this baseline. Hardware instruction encoding and device schedules belong to the selected C library. Pin headers to the actual hardware; a local `gemmini_params.h` must not be assumed to describe stock signed-int8 arithmetic.
 

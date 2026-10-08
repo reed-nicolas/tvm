@@ -351,7 +351,7 @@ class BinaryBase(OnnxOpConverter):
             arr = _np.asarray(result)
             if arr.ndim == 0:
                 return relax.PrimValue(arr.item())
-            return relax.const(arr)
+            return relax.const(arr, str(arr.dtype))
 
         return cls.relax_op(inputs[0], inputs[1])  # pylint: disable=not-callable
 
