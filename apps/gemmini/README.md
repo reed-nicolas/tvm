@@ -19,7 +19,7 @@ under the License.
 
 # Gemmini integration organization
 
-Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. An opt-in Relax pass now lowers a narrow integer matmul contract to an external C call, validated with a test-only host implementation. Gemmini C-library binding, target runtime integration, pretrained qualification and accelerator execution remain pending.
+Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. An opt-in Relax pass lowers a narrow integer matmul contract to an external C call, validated with a test-only host implementation. Its actual Gemmini C-library adapter now cross-compiles against pinned integer headers. Target runtime integration, pretrained qualification and accelerator numerical execution remain pending.
 
 | Future location | Integration responsibility |
 | --- | --- |
@@ -37,9 +37,9 @@ The host recipe opts into `USE_HOST_ONLY_AUTO_COPY_GUARD` (OFF by default) becau
 
 Optional `--case`, `--opset` and `--importer-source` narrow checks or isolate a historical Python importer on the current runtime. Historical negative-Gather overrides retain imported IR but do not execute potentially unchecked indices; their status is `not_executed`, never a pass. The original v0.19 importer fails the opset-18 RMSNorm case numerically and fails the shape-array, lower-rank Expand and scalar ConstantOfShape cases during import. A local follow-up preserves the NumPy dtype when folding shape arithmetic, preventing the inherited binary fix from silently narrowing int64 output. These cases do not exercise every inherited change or qualify model/device behavior.
 
-The selected backend route calls the Gemmini C operator library, following the comparison team's fairness guidance. Preserve shapes, layouts, quantization scales, rounding and output semantics; make supported shapes/layouts, argument contracts, numerical rules, workspace requirements and instruction policy explicit. The handwritten compiler remains a separate reference, and its zero hardware-loop policy does not automatically apply to this baseline. Hardware instruction encoding and device schedules belong to the selected C library. Pin headers to the actual hardware; a local `gemmini_params.h` must not be assumed to describe stock signed-int8 arithmetic.
+The selected backend route calls the Gemmini C operator library, following the comparison team's fairness guidance. Preserve shapes, layouts, quantization scales, rounding and output semantics; make supported shapes/layouts, argument contracts, numerical rules, workspace requirements and instruction policy explicit. Agustin requires every implementation, including this baseline, to avoid FSM/hardware-loop instructions. The handwritten compiler is the evaluated Phase-1/2 implementation, not a baseline dependency or configuration authority. Hardware instruction encoding and device schedules belong to the selected C library. Pin headers to the actual hardware; a local `gemmini_params.h` must not be assumed to describe stock signed-int8 arithmetic.
 
-The reference Gemmini deployment uses baremetal; whether this comparison shares that runtime is awaiting confirmation. Linux with the Relax VM is another unqualified option. Host export/reload proves neither RISC-V nor baremetal deployment. Confirm host ISA/ABI, runtime support and addressability; hardware revision, generated headers, quantization and timing boundaries remain explicit inputs. MX Gemmini requires a different hardware and numerical contract. Expose CPU work, data conversion, transfer and completion costs to the comparison harness.
+Agustin permits baremetal or RTOS; this integration chooses baremetal. Host export/reload alone proves neither RISC-V nor baremetal deployment. The independent CPU probe establishes a bounded static generated-graph route under generic Spike, not general Relax runtime support. Confirm actual deployment ISA/ABI, startup and addressability; hardware revision, generated headers, quantization and timing boundaries remain explicit inputs. MX Gemmini requires a different hardware and numerical contract. Expose CPU work, data conversion, transfer and completion costs to the comparison harness.
 
 ## External matmul compiler boundary
 
@@ -53,6 +53,47 @@ The tests export/reload both bytecode and compiled Relax executables and explici
 python tests/python/relax/test_backend_contrib_gemmini.py -v
 ```
 
-The test requires LLVM-enabled TVM, NumPy and `cc` on PATH. It covers rectangular shapes, negative/extreme inputs, the admitted reduction bound, repeated calls, frozen constants, wrapper reuse, CPU fallback, function/control-flow preservation and failure propagation. No accelerator headers, simulator or FPGA are used. Matching generated integer headers, library instruction policy and a proven target runtime are prerequisites for implementing the device side of this ABI.
+The test requires LLVM-enabled TVM, NumPy and `cc` on PATH. It covers rectangular shapes, negative/extreme inputs, the admitted reduction bound, repeated calls, frozen constants, wrapper reuse, CPU fallback, function/control-flow preservation and failure propagation. No accelerator headers, simulator or FPGA are used.
+
+## Pinned C-library adapter
+
+[matmul.c](matmul.c) implements the external ABI through `tiled_matmul` with primitive OS and fixed one-array I/J/K tiles, null bias, identity input/output scales, no activation and full int32 output. It rejects invalid dimensions, strides, unrepresentable byte spans and output/input overlap before issuing accelerator instructions. Callers must supply mapped, DMA-accessible buffers and exclusive accelerator ownership. CPU/compiler barriers surround the library's device call and fence; platform coherence remains a separate qualification.
+
+Hardware loops are forbidden, with explicit `TVM_GEMMINI_FORBID_HW_LOOPS=1` and `TVM_GEMMINI_PE_OUTPUT_BITS=20`. The provisional Scala configuration has 20-bit PE output, which the C parameter header does not expose. Fixed DIM=16 and tile_K=1 keep each PE reduction representable for arbitrary int8 inputs, while outer K tiles accumulate in int32. An arbitrary automatic OS tile choice does not preserve this guarantee. The canonical integer header lacks `NORM_STAT_IDS`, which the operator header references even for no-activation calls. An integration-only fallback allows those unused branches to parse while rejecting `HAS_NORMALIZATIONS`. The canonical parameter header is unchanged and normalization is not supported.
+
+[verify_matmul.py](verify_matmul.py) extracts only the selected Git blobs from existing local repositories. Its default source set is Gemmini `6ad65b90b1eb270c20ce4f04109e3dde0180b36f`, gemmini-rocc-tests `7c540b3adf1b86ad93d07f893abe3a73489b568e` and libgemmini `ea8f7ed7afd68e001fb06ddccad9a023c990961d`. It validates parameter/operator digests, stages the exact nested includes, cross-compiles RV64GC/lp64d and records resolved header, source, compiler, object and disassembly identities. It checks primitive-only instruction policy as well as rejection of incompatible headers. The final object must have no FSM instructions in any executable section; the same audit must be applied again to the final linked ELF. This verifies compilation, not a simulator/plugin build or numerical device execution.
+
+From the comparison checkout, set the actual reference checkout and RISC-V toolchain paths:
+
+```sh
+GEMMINI_ROOT=/path/to/chipyard/generators/gemmini
+RISCV_BIN=/path/to/riscv-tools/bin
+TVM_ROOT="$PWD/third_party/baselines/tvm-gemmini"
+BUILD_ROOT="$PWD/out/build/baselines/tvm-gemmini"
+python "$TVM_ROOT/apps/gemmini/verify_matmul.py" --gemmini-repo "$GEMMINI_ROOT" --build-root "$BUILD_ROOT" \
+  --cc "$RISCV_BIN/riscv64-unknown-elf-gcc" --objdump "$RISCV_BIN/riscv64-unknown-elf-objdump"
+```
+
+All required Git objects, including the pinned nested rocc-software commit, must already exist locally. No fetch, checkout, reference-header edit or TVM/RTL rebuild occurs. Use `--rocc-tests-repo` or `--rocc-software-repo` for separate checkouts and `--output-dir` for a fresh child of the selected build root. Link only the audited `matmul.o`: a relocatable link keeps the ABI entrypoint and its relocation dependencies while removing unused vendor WS code from `matmul.raw.o`. The raw object is diagnostic and must not be linked. Pass `--audit-elf /path/to/final.elf` to check all executable sections again after final linking. The no-FSM policy is confirmed. Jack identifies default Gemmini with a Rocket host; the exact FireSim build, matching generated headers and guest capacity remain unbound, and these source pins do not adopt gemmini-mlir as a baseline.
+
+## Bounded baremetal CPU proof
+
+[verify_baremetal_cpu.py](verify_baremetal_cpu.py) compiles a fixed FP32 matmul/add/ReLU Relax graph into RISC-V CPU operations and derives static calls/constants from its legalized bindings. It links machine-mode startup, HTIF console/exit and caller-owned buffers without guest libc, libtvm, a C++ runtime or heap. Eight calls across five inputs must match an independent scalar oracle exactly, preserve input/constant/previous-output bytes and buffer canaries, and recover from a null-input rejection. A deliberately incorrect oracle must produce a failing target exit. Dynamic shapes, other dtypes, tuple outputs and unlegalized graphs are rejected.
+
+This is an independent, narrow deployment proof, not a general Relax VM replacement or a complete-model exporter. Only this graph is numerically qualified. The verifier records generated IR, commands, tool/library/source identities, ELF memory bounds, one resident constant copy, reused workspace and a painted-stack high-water observation. It requests 256 MiB in generic Spike; that is not a statement about deployed DRAM. No Gemmini plugin or accelerator execution is involved.
+
+In the activated host environment, from the comparison checkout, supply the actual installed tool paths:
+
+```sh
+TVM_ROOT="$PWD/third_party/baselines/tvm-gemmini"
+BUILD_ROOT="$PWD/out/build/baselines/tvm-gemmini"
+RISCV_BIN=/path/to/riscv-tools/bin
+SPIKE_SUPPORT=/path/to/spike-dependencies
+python "$TVM_ROOT/apps/gemmini/verify_baremetal_cpu.py" --tvm-source "$TVM_ROOT" --tvm-build "$BUILD_ROOT/host" \
+  --riscv-gcc "$RISCV_BIN/riscv64-unknown-elf-gcc" --spike "$RISCV_BIN/spike" --dtc "$SPIKE_SUPPORT/bin/dtc" \
+  --spike-library-dir "$SPIKE_SUPPORT/lib" --output-dir "$BUILD_ROOT/baremetal-cpu-check"
+```
+
+The output directory must be new. Spike's selected library directory must provide its compatible `libstdc++.so.6`; the verifier supplies this path and the selected `dtc` to the Spike process without sourcing global Chipyard setup. Review the recorded limits before extending this proof to additional graphs or a real platform startup/transport.
 
 The model order is canonical ResNet50, TinyLlama 1B, then SmolVLA. Prove small matmul and convolution cases using the selected target's arithmetic before full-model device execution. The proposed signed-int8/int32 contract requires matching hardware and generated headers; it does not apply to a floating-point configuration. Keep model inputs and quality thresholds fixed through performance tuning; functional simulator evidence and qualified timing evidence serve distinct roles. Final comparison timing comes from FireSim, with platform and capture details coordinated by the comparison team. Keep full-model inputs, comparisons and measurement orchestration in the parent comparison repository. Build products, environments, model weights, captures and outputs stay outside this source tree, using the parent's configured `out/build/baselines/tvm-gemmini/` and other `out/` roots.
