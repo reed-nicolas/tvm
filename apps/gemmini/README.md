@@ -19,7 +19,7 @@ under the License.
 
 # Gemmini integration organization
 
-Work belongs on `gemmini/bringup`. The isolated host compiler/runtime build and twenty synthetic frontend CPU checks are verified; no Gemmini backend is registered and no full model has been run. The source locations below are planned and unimplemented.
+Work belongs on `gemmini/bringup`. The isolated host compiler/runtime build, twenty synthetic frontend CPU checks and a full ResNet50 v1.5 architecture diagnostic with random weights and two synthetic images are verified on host CPU. Pretrained/full-session qualification and Gemmini execution remain pending; no Gemmini backend is registered. The source locations below are planned and unimplemented.
 
 | Future location | Integration responsibility |
 | --- | --- |
@@ -41,4 +41,4 @@ The selected backend route calls the Gemmini C operator library, following the c
 
 RISC-V Linux with the Relax VM is the preferred deployment proposal, subject to platform support and memory capacity. Confirm host ISA/ABI, Linux/runtime support and addressability; hardware revision, generated headers, quantization and timing boundaries remain explicit inputs. MX Gemmini requires a different hardware and numerical contract. Expose CPU work, data conversion, transfer and completion costs to the comparison harness.
 
-The model order is canonical ResNet50, TinyLlama 1B, then SmolVLA. Prove small integer matmul and convolution cases before full-model execution. Keep model inputs and quality thresholds fixed through performance tuning; functional simulator evidence and qualified timing evidence serve distinct roles. Final comparison timing comes from FireSim, with platform and capture details coordinated by the comparison team. Keep full-model inputs, comparisons and measurement orchestration in the parent comparison repository. Build products, environments, model weights, captures and outputs stay outside this source tree, using the parent's configured `out/build/baselines/tvm-gemmini/` and other `out/` roots.
+The model order is canonical ResNet50, TinyLlama 1B, then SmolVLA. Prove small matmul and convolution cases using the selected target's arithmetic before full-model device execution. The proposed signed-int8/int32 contract requires matching hardware and generated headers; it does not apply to a floating-point configuration. Keep model inputs and quality thresholds fixed through performance tuning; functional simulator evidence and qualified timing evidence serve distinct roles. Final comparison timing comes from FireSim, with platform and capture details coordinated by the comparison team. Keep full-model inputs, comparisons and measurement orchestration in the parent comparison repository. Build products, environments, model weights, captures and outputs stay outside this source tree, using the parent's configured `out/build/baselines/tvm-gemmini/` and other `out/` roots.
