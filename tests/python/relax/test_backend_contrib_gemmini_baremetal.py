@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import tvm
@@ -29,7 +30,7 @@ from tvm import relax, tir
 
 APP = Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"
 sys.path.insert(0, str(APP))
-from baremetal import export_graph, plan_graph
+from baremetal import export_graph, plan_graph, preflight_graph
 
 
 def aligned(shape, dtype):
@@ -78,6 +79,19 @@ def custom_graph(*, alignment=64, multi_output=False, attribute=None, storage_al
             result = builder.emit(relax.call_tir(gv, [value], [info, info] if multi_output else info))
             live_result = builder.emit(relax.TupleGetItem(result, 1)) if multi_output else result
             output = builder.emit_output(relax.op.add(live_result, relax.const(1, "int32")))
+        builder.emit_func_output(output)
+    return relax.transform.LegalizeOps()(builder.get())
+
+
+def residual_graph():
+    value = relax.Var("x", relax.TensorStructInfo((8,), "int32"))
+    builder = relax.BlockBuilder()
+    with builder.function("main", [value]):
+        with builder.dataflow():
+            residual = builder.emit(relax.op.add(value, relax.const(np.full(8, 1, "int32"))))
+            branch = builder.emit(relax.op.multiply(residual, relax.const(np.full(8, 2, "int32"))))
+            branch = builder.emit(relax.op.add(branch, relax.const(np.full(8, 3, "int32"))))
+            output = builder.emit_output(relax.op.add(residual, branch))
         builder.emit_func_output(output)
     return relax.transform.LegalizeOps()(builder.get())
 
@@ -185,6 +199,60 @@ class StaticGraphTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             export_graph(graph(), self.root, target="llvm", memory_limit_bytes=1)
         self.assertFalse((self.root / "model.c").exists())
+
+    def test_residual_preflight_and_execution_keep_branch_live(self):
+        mod = residual_graph()
+        preflight = preflight_graph(mod)
+        self.assertEqual(preflight["allocated"]["workspace_bytes"], 192)
+        self.assertEqual(preflight["peak_live_workspace_bytes"], 96)
+        self.assertEqual(preflight["peak_live_workspace_aligned_bytes"], 192)
+        self.assertEqual(preflight["allocated"]["constants_bytes"], 192)
+        self.assertEqual(preflight["peak_live_tensor_bytes"], 160)
+        self.assertEqual(preflight["allocated"]["explicit_tensor_bytes"], 448)
+        self.assertEqual(preflight["per_call"][2]["live_tensors"],
+                         ["constant_2", "tensor_0", "tensor_1", "tensor_2"])
+        self.assertIn("tensor_0", preflight["per_call"][3]["live_tensors"])
+        report, loaded, inputs, outputs, workspace = self.compile(mod)
+        self.assertEqual(report["memory_preflight"], preflight)
+        for seed in (-100, 37, -100):
+            value = np.arange(8, dtype="int32") + seed
+            inputs[0][:] = value
+            workspace[:] = 0xa5
+            self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+            np.testing.assert_array_equal(outputs[0], 3 * value + 6)
+            np.testing.assert_array_equal(inputs[0], value)
+
+    def test_duplicate_returns_have_unique_liveness_and_disjoint_storage(self):
+        mod = graph(tuple_output=True)
+        plan = plan_graph(mod)
+        report = preflight_graph(mod)
+        outputs = plan["outputs"]
+        self.assertIs(outputs[1], outputs[3])
+        self.assertEqual(report["allocated"]["output_bytes"], 102)
+        self.assertEqual(report["completion"]["live_tensor_bytes"], 70)
+        self.assertEqual(len(report["completion"]["live_tensors"]), 3)
+        self.assertEqual([item["copy_required"] for item in report["output_bindings"]],
+                         [False, False, True, True])
+        for entry in report["per_call"]:
+            self.assertEqual(len(entry["live_tensors"]), len(set(entry["live_tensors"])))
+        self.assertEqual(report["allocated"]["explicit_tensor_bytes"],
+                         plan["workspace_bytes"] + plan["constants_bytes"] + 6 + 102)
+
+    def test_preflight_budget_matches_export_before_codegen_or_artifacts(self):
+        mod = residual_graph()
+        report = preflight_graph(mod)
+        required = report["allocated"]["explicit_tensor_bytes"]
+        self.assertEqual(preflight_graph(mod, memory_limit_bytes=required)["allocated"],
+                         report["allocated"])
+        with patch("baremetal.tvm.build", side_effect=AssertionError("unexpected code generation")):
+            for limit in (required - 1, 0, True, 1.5):
+                with self.subTest(limit=limit):
+                    with self.assertRaisesRegex(ValueError, "memory budget"):
+                        preflight_graph(mod, memory_limit_bytes=limit)
+                    with self.assertRaisesRegex(ValueError, "memory budget"):
+                        export_graph(mod, self.root, target="llvm", memory_limit_bytes=limit)
+            preflight_graph(mod, memory_limit_bytes=required)
+        self.assertEqual(list(self.root.iterdir()), [])
 
 
 if __name__ == "__main__":

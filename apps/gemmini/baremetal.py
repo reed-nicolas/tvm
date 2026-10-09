@@ -226,6 +226,56 @@ def plan_graph(mod):
     return {"inputs": inputs, "outputs": outputs, "constants": constants, "tensors": tensors, "calls": calls, "functions": functions, "workspace_bytes": workspace_bytes, "constants_bytes": constants_bytes}
 
 
+def _memory_preflight(plan, memory_limit_bytes):
+    """Report logical liveness separately from physically reserved tensor storage."""
+    allocated = {
+        "input_bytes": sum(t.nbytes for t in plan["inputs"]),
+        # Every return slot requires disjoint caller storage, including aliases.
+        "output_bytes": sum(t.nbytes for t in plan["outputs"]),
+        "constants_bytes": plan["constants_bytes"],
+        "workspace_bytes": plan["workspace_bytes"],
+    }
+    tensors_bytes = sum(allocated.values())
+    allocated["explicit_tensor_bytes"] = tensors_bytes
+    if isinstance(memory_limit_bytes, bool) or not isinstance(memory_limit_bytes, int) or memory_limit_bytes <= 0 or tensors_bytes > memory_limit_bytes:
+        raise ValueError("explicit tensor storage exceeds the supplied memory budget")
+    # Tensor identities, rather than graph aliases or repeated output slots,
+    # describe logical values. Input/constant allocations remain resident even
+    # after their last graph use; allocated above includes their full envelopes.
+    tensors = list(dict.fromkeys([*plan["inputs"], *plan["constants"], *plan["tensors"]]))
+    per_call = []
+    for index, (symbol, _, _) in enumerate(plan["calls"]):
+        live = [t for t in tensors if t.birth <= index <= t.last_use]
+        workspace = [t for t in live if t.origin == "workspace"]
+        per_call.append({
+            "index": index, "symbol": symbol,
+            "live_tensors": [t.name for t in live],
+            "live_tensor_bytes": sum(t.nbytes for t in live),
+            "live_workspace_bytes": sum(t.nbytes for t in workspace),
+            "live_workspace_aligned_bytes": sum(_aligned(t.nbytes) for t in workspace),
+        })
+    completion = list(dict.fromkeys(plan["outputs"]))
+    return {
+        "scope": "explicit tensor storage only; excludes ELF sections, operator stack, startup and platform reservations",
+        "memory_limit_bytes": memory_limit_bytes,
+        "allocated": allocated,
+        "per_call": per_call,
+        "completion": {"live_tensors": [t.name for t in completion], "live_tensor_bytes": sum(t.nbytes for t in completion)},
+        "peak_live_tensor_bytes": max([entry["live_tensor_bytes"] for entry in per_call] + [sum(t.nbytes for t in completion)]),
+        "peak_live_workspace_bytes": max(entry["live_workspace_bytes"] for entry in per_call),
+        "peak_live_workspace_aligned_bytes": max(entry["live_workspace_aligned_bytes"] for entry in per_call),
+        "largest_intermediates": [t.metadata() for t in sorted((t for t in plan["tensors"] if t.origin == "workspace"), key=lambda t: (-t.nbytes, t.name))[:10]],
+        "output_bindings": [{"index": index, "tensor": t.name, "storage": t.origin,
+                             "copy_required": t.origin != "output" or t.offset != index}
+                            for index, t in enumerate(plan["outputs"])],
+    }
+
+
+def preflight_graph(mod, *, memory_limit_bytes=1 << 30):
+    """Check tensor-only capacity and report static liveness without code generation."""
+    return _memory_preflight(plan_graph(mod), memory_limit_bytes)
+
+
 def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 << 30):
     """Write operators, one constant blob, C orchestration and a storage manifest.
 
@@ -236,9 +286,8 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
     this static exporter provides no guest allocator or callback initialization.
     """
     plan = plan_graph(mod)
-    tensors_bytes = plan["workspace_bytes"] + plan["constants_bytes"] + sum(t.nbytes for t in [*plan["inputs"], *plan["outputs"]])
-    if isinstance(memory_limit_bytes, bool) or not isinstance(memory_limit_bytes, int) or memory_limit_bytes <= 0 or tensors_bytes > memory_limit_bytes:
-        raise ValueError("explicit tensor storage exceeds the supplied memory budget")
+    preflight = _memory_preflight(plan, memory_limit_bytes)
+    tensors_bytes = preflight["allocated"]["explicit_tensor_bytes"]
     output_dir = checked_path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     constant_path = output_dir / "constants.bin"
@@ -313,6 +362,7 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
         "target": str(target), "alignment_bytes": ALIGNMENT, "heap_required_by_orchestration": False, "runtime_workspace_allocator_required": False,
         "workspace_bytes": plan["workspace_bytes"], "constants_bytes": plan["constants_bytes"], "explicit_tensor_bytes": tensors_bytes,
         "memory_limit_bytes": memory_limit_bytes, "memory_scope": "tensor storage only; add ELF sections, operator stack/workspace, startup and platform reservations",
+        "memory_preflight": preflight,
         "inputs": [tensor.metadata() for tensor in plan["inputs"]], "outputs": [tensor.metadata() for tensor in plan["outputs"]],
         "constants": [tensor.metadata() for tensor in plan["constants"]], "intermediates": [tensor.metadata() for tensor in plan["tensors"]],
         "calls": [{"symbol": name, "inputs": [t.name for t in args], "outputs": [t.name for t in results]} for name, args, results in plan["calls"]],
