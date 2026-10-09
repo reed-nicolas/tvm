@@ -64,6 +64,8 @@ _Static_assert(_Generic((acc_scale_t)0, float: 1, default: 0), "acc_scale_t must
 _Static_assert(sizeof(size_t) == 8 && sizeof(uintptr_t) == 8, "RV64 pointer/size ABI required");
 _Static_assert(DIM == 16, "the bounded OS schedule requires DIM=16");
 _Static_assert(BANK_NUM * BANK_ROWS >= 2 * DIM && ACC_ROWS >= DIM, "insufficient resources for an OS tile");
+_Static_assert(ADDR_LEN == 32, "the primitive ABI requires 32-bit local addresses");
+_Static_assert(BANK_NUM * BANK_ROWS == 16384 && ACC_ROWS == 1024, "the primitive row allocation contract requires the pinned capacities");
 
 /* Conservative byte envelopes include stride padding. Callers must own and map
  * the entire envelope; this validates representability, not allocation or DMA
@@ -83,8 +85,8 @@ static int span(const void* data, uint64_t rows, uint64_t cols, uint64_t stride,
   return 1;
 }
 
-int32_t tvm_gemmini_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, int64_t m, int64_t n, int64_t k,
-                                int64_t a_stride, int64_t b_stride, int64_t c_stride) {
+int32_t tvm_gemmini_validate_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, int64_t m, int64_t n, int64_t k,
+                                         int64_t a_stride, int64_t b_stride, int64_t c_stride) {
   if (m <= 0 || n <= 0 || k <= 0 || k > 131071 || a_stride <= 0 || b_stride <= 0 || c_stride <= 0 || (uintptr_t)c % _Alignof(int32_t) != 0) {
     return -1;
   }
@@ -106,6 +108,65 @@ int32_t tvm_gemmini_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, 
   }
   if (MVIN_SCALE_IDENTITY != 1.0f || ACC_SCALE_IDENTITY != 1.0f) {
     return -4;
+  }
+  return 0;
+}
+
+/* Match the vendor OS helper's accumulator addressing. The caller supplies row
+ * allocation only; this wrapper owns the source-derived instruction flags.
+ */
+static uint32_t accumulator_address(uint32_t row, int32_t accumulate) {
+  return (1U << (ADDR_LEN - 1)) | (1U << (ADDR_LEN - 3)) | ((uint32_t)accumulate << (ADDR_LEN - 2)) | row;
+}
+
+void tvm_gemmini_begin(int64_t a_stride, int64_t b_stride, int64_t c_stride) {
+  /* Flush stale translations once. CPU fences do not establish DMA coherence;
+   * exclusive ownership and the platform completion contract remain required.
+   */
+  asm volatile("fence rw,rw" ::: "memory");
+  gemmini_flush(0);
+  gemmini_config_ex(OUTPUT_STATIONARY, NO_ACTIVATION, 0);
+  gemmini_config_st((uint64_t)c_stride * sizeof(acc_t));
+  gemmini_extended3_config_ld((uint64_t)a_stride, MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld((uint64_t)b_stride, MVIN_SCALE_IDENTITY, false, 1);
+}
+
+void tvm_gemmini_load_a(const int8_t* src, uint32_t spadrow, uint32_t rows, uint32_t cols) {
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvin(src, spadrow, cols, rows);
+  asm volatile("" ::: "memory");
+}
+
+void tvm_gemmini_load_b(const int8_t* src, uint32_t spadrow, uint32_t rows, uint32_t cols) {
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvin2(src, spadrow, cols, rows);
+  asm volatile("" ::: "memory");
+}
+
+void tvm_gemmini_compute(uint32_t arow, uint32_t brow, uint32_t crow, uint32_t m, uint32_t n, uint32_t k, int32_t accumulate) {
+  /* Restart the PE reduction for every chunk; accumulation across global K
+   * happens in int32 SRAM, preserving the 20-bit PE bound for <=16 products.
+   */
+  gemmini_extended_preload(GARBAGE_ADDR, accumulator_address(crow, accumulate), DIM, DIM, n, m);
+  gemmini_extended_compute_preloaded(arow, brow, k, m, n, k);
+}
+
+void tvm_gemmini_store(int32_t* dst, uint32_t crow, uint32_t rows, uint32_t cols) {
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvout(dst, accumulator_address(crow, 1), cols, rows);
+  asm volatile("" ::: "memory");
+}
+
+void tvm_gemmini_end(void) {
+  gemmini_fence();
+  asm volatile("fence rw,rw" ::: "memory");
+}
+
+int32_t tvm_gemmini_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, int64_t m, int64_t n, int64_t k,
+                                int64_t a_stride, int64_t b_stride, int64_t c_stride) {
+  int32_t admission = tvm_gemmini_validate_matmul_i8_i32(a, b, c, m, n, k, a_stride, b_stride, c_stride);
+  if (admission != 0) {
+    return admission;
   }
 
   /* Exclusive accelerator ownership is a caller obligation. Flush stale address

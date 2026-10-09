@@ -33,6 +33,31 @@ extern "C" {
  */
 int32_t tvm_gemmini_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, int64_t m, int64_t n, int64_t k, int64_t a_stride, int64_t b_stride, int64_t c_stride);
 
+/* CPU-only whole-operation admission. Call before issuing any primitive.
+ * The return values and memory contract match tvm_gemmini_matmul_i8_i32.
+ */
+int32_t tvm_gemmini_validate_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, int64_t m, int64_t n, int64_t k, int64_t a_stride, int64_t b_stride, int64_t c_stride);
+
+/* Trusted compiler-generated primitive contract: validation above passed; the
+ * caller owns the accelerator exclusively from begin through end. TVM owns all
+ * tile loops, pointer offsets, local allocation, reuse, and reduction ordering.
+ * Begin uses the validated strides; every DMA pointer is a proven subview of
+ * the validated A/B/C envelopes. Strides count elements. Local addresses are plain DIM-aligned row indices;
+ * reserve 16 rows per tile within 16384 scratchpad / 1024 accumulator rows.
+ * A/B tile slots are disjoint. Every tile dimension is in [1,16], and accumulate
+ * is exactly 0 (overwrite) or 1 (add to initialized int32 accumulator SRAM).
+ * Each compute starts a fresh <=16-product PE reduction; global K <=131071.
+ * A/B and any DMA source staging buffers remain immutable until end. Store is
+ * asynchronous: read C only after end. These functions do no runtime admission.
+ * The runtime must supply DMA mapping, completion, and platform coherence.
+ */
+void tvm_gemmini_begin(int64_t a_stride, int64_t b_stride, int64_t c_stride);
+void tvm_gemmini_load_a(const int8_t* src, uint32_t spadrow, uint32_t rows, uint32_t cols);
+void tvm_gemmini_load_b(const int8_t* src, uint32_t spadrow, uint32_t rows, uint32_t cols);
+void tvm_gemmini_compute(uint32_t arow, uint32_t brow, uint32_t crow, uint32_t m, uint32_t n, uint32_t k, int32_t accumulate);
+void tvm_gemmini_store(int32_t* dst, uint32_t crow, uint32_t rows, uint32_t cols);
+void tvm_gemmini_end(void);
+
 #ifdef __cplusplus
 }
 #endif

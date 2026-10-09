@@ -78,6 +78,8 @@ All required Git objects, including the pinned nested rocc-software commit, must
 
 ## Primitive adapter numerical verification
 
+The header also exposes CPU-only whole-operation validation and `begin`, `load_a`, `load_b`, `compute`, `store` and `end` primitives for compiler-generated schedules. TVM supplies plain scratchpad/accumulator row allocations, tile extents and reduction ordering; these wrappers only configure the device and emit vendor-library primitive instructions. Validate all user buffers before `begin`, keep A/B immutable through `end`, and prove the row/dimension contract in [matmul.h](matmul.h). Each compute restarts a reduction of at most 16 products in the signed20 PE; later chunks add into int32 accumulator SRAM. First-chunk overwrite and subsequent accumulation are distinct operations. The adapter verifier retains and audits every public primitive, including uncalled ones; never link the raw object containing unused vendor FSM code.
+
 [verify_matmul_runtime.py](verify_matmul_runtime.py) links the audited adapter object into baremetal programs and executes them with an explicitly selected, source-bound Gemmini Spike plugin. It requires passing adapter and simulator build receipts, verifies their source/tool/header bindings before and after execution, and audits every executable section of the final ELFs for prohibited FSM instructions. The simulator builder lives in the comparison repository at `examples/gemmini/comparisons/tvm/build_simulator.py`.
 
 ```sh

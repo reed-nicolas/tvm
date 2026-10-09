@@ -37,6 +37,10 @@ import subprocess
 HARDWARE_REVISION = "6ad65b90b1eb270c20ce4f04109e3dde0180b36f"
 PARAMS_SHA256 = "3758ae967af3a179497660970201093a7fb624be00173990ce33d3f5c38da924"
 OPERATOR_SHA256 = "18801f4eab0cd2e81e25a6c2aa97c7ed644b693e8d2c24cdeb41ab3a7208336d"
+PUBLIC_SYMBOLS = (
+    "tvm_gemmini_matmul_i8_i32", "tvm_gemmini_validate_matmul_i8_i32", "tvm_gemmini_begin",
+    "tvm_gemmini_load_a", "tvm_gemmini_load_b", "tvm_gemmini_compute", "tvm_gemmini_store", "tvm_gemmini_end",
+)
 
 
 def allowed(path):
@@ -219,16 +223,18 @@ def main():
     compiled = run(compile_command)
     (output / "compile.log").write_bytes(compiled.stderr)
     # The vendor header can leave an unreferenced WS helper in the raw object.
-    # Keep only the public ABI and its full relocation closure, then audit every
+    # Keep every public ABI and its full relocation closure, then audit every
     # remaining executable section. Never link the raw diagnostic object.
     link_command = [cc, "-march=rv64gc", "-mabi=lp64d", "-nostdlib", "-r",
-                    "-Wl,--gc-sections,-e,tvm_gemmini_matmul_i8_i32", raw_object_path, "-o", object_path]
+                    "-Wl,--gc-sections,-e,tvm_gemmini_matmul_i8_i32",
+                    *[f"-Wl,--undefined={name}" for name in PUBLIC_SYMBOLS], raw_object_path, "-o", object_path]
     linked = run(link_command)
     (output / "partial_link.log").write_bytes(linked.stderr)
     disassembly = run([objdump, "-dr", object_path]).stdout
     (output / "matmul.disassembly").write_bytes(disassembly)
-    if b"<tvm_gemmini_matmul_i8_i32>:" not in disassembly:
-        raise ValueError("Compiled object lacks the external matmul symbol")
+    for name in PUBLIC_SYMBOLS:
+        if f"<{name}>:".encode() not in disassembly:
+            raise ValueError(f"Compiled object lacks the public symbol: {name}")
 
     definitions = {}
     for relative in ("include/gemmini_params.h", "include/gemmini.h"):
@@ -294,7 +300,7 @@ def main():
         "source_set": {"gemmini": revision, "gemmini_rocc_tests": rocc_revision,
                        "rocc_software": custom_revision, "libgemmini": simulator_revision},
         "hardware_source_check": {"configs_sha256": digest(hardware_config), "fields": observed_fields, "execution_verified": False},
-        "headers": headers, "adapter_sources": sources,
+        "headers": headers, "adapter_sources": sources, "public_symbols": list(PUBLIC_SYMBOLS),
         "resolved_headers": {str(path): digest(path.read_bytes()) for path in sorted(resolved)},
         "compiler": {"path": str(cc), "sha256": digest(cc.read_bytes()),
                      "version": run([cc, "--version"]).stdout.decode().splitlines()[0]},
