@@ -232,6 +232,8 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
     The limit covers explicit tensor storage only; executable sections, generated
     operator stack allocations, startup and platform reservations are additional.
     Caller-supplied buffers must each contain the manifest's full byte envelope.
+    Emitted TVM runtime workspace allocation/free dependencies are rejected;
+    this static exporter provides no guest allocator or callback initialization.
     """
     plan = plan_graph(mod)
     tensors_bytes = plan["workspace_bytes"] + plan["constants_bytes"] + sum(t.nbytes for t in [*plan["inputs"], *plan["outputs"]])
@@ -296,12 +298,19 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
     (output_dir / "model.c").write_text("\n".join(lines) + "\n")
     primitive_mod = tvm.IRModule(plan["functions"]).with_attr("executor", tvm.relay.backend.Executor("aot", {"unpacked-api": True, "interface-api": "c"}))
     module = tvm.build(primitive_mod, target=target)
+    llvm_ir = module.get_source("ll")
+    (output_dir / "operators.ll").write_text(llvm_ir)
+    # The pinned LLVM backend may emit null callback globals instead of ordinary
+    # undefined function symbols. A successful static link cannot prove these
+    # calls are usable without TVM's runtime initializing the module context.
+    allocators = sorted(set(re.findall(r'@"?((?:__)?TVMBackend(?:Alloc|Free)Workspace)"?(?=[\s(,])', llvm_ir)))
+    if allocators:
+        raise ValueError("unsupported TVM runtime workspace allocator dependency: " + ", ".join(allocators))
     module.save(str(output_dir / "operators.o"))
-    (output_dir / "operators.ll").write_text(module.get_source("ll"))
     (output_dir / "operators.tir.py").write_text(primitive_mod.script(show_meta=True))
     (output_dir / "graph.relax.py").write_text(mod.script(show_meta=True))
     manifest = {
-        "target": str(target), "alignment_bytes": ALIGNMENT, "heap_required_by_orchestration": False,
+        "target": str(target), "alignment_bytes": ALIGNMENT, "heap_required_by_orchestration": False, "runtime_workspace_allocator_required": False,
         "workspace_bytes": plan["workspace_bytes"], "constants_bytes": plan["constants_bytes"], "explicit_tensor_bytes": tensors_bytes,
         "memory_limit_bytes": memory_limit_bytes, "memory_scope": "tensor storage only; add ELF sections, operator stack/workspace, startup and platform reservations",
         "inputs": [tensor.metadata() for tensor in plan["inputs"]], "outputs": [tensor.metadata() for tensor in plan["outputs"]],

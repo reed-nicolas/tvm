@@ -150,6 +150,16 @@ class StaticGraphTests(unittest.TestCase):
         np.testing.assert_array_equal(outputs[0], expected)
         self.assertLess(len(report["calls"]), 4)
 
+    def test_large_unscheduled_fused_buffer_requires_rejected_runtime_allocator(self):
+        # Large internal buffers lower to indirect runtime callbacks; never load
+        # or execute this object without the TVM runtime initializing them.
+        optimized = relax.get_pipeline("zero")(graph(dtype="float32", shape=(128, 3)))
+        with self.assertRaisesRegex(ValueError, "runtime workspace allocator"):
+            export_graph(optimized, self.root, target="llvm")
+        self.assertIn("@__TVMBackendAllocWorkspace", (self.root / "operators.ll").read_text())
+        self.assertFalse((self.root / "operators.o").exists())
+        self.assertFalse((self.root / "graph.json").exists())
+
     def test_unused_multi_output_sibling_cannot_alias_live_result(self):
         report, loaded, inputs, outputs, workspace = self.compile(custom_graph(multi_output=True))
         first, second = report["intermediates"][:2]
