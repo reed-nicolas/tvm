@@ -76,6 +76,18 @@ python "$TVM_ROOT/apps/gemmini/verify_matmul.py" --gemmini-repo "$GEMMINI_ROOT" 
 
 All required Git objects, including the pinned nested rocc-software commit, must already exist locally. No fetch, checkout, reference-header edit or TVM/RTL rebuild occurs. Use `--rocc-tests-repo` or `--rocc-software-repo` for separate checkouts and `--output-dir` for a fresh child of the selected build root. Link only the audited `matmul.o`: a relocatable link keeps the ABI entrypoint and its relocation dependencies while removing unused vendor WS code from `matmul.raw.o`. The raw object is diagnostic and must not be linked. Pass `--audit-elf /path/to/final.elf` to check all executable sections again after final linking. The no-FSM policy is confirmed. Jack identifies default Gemmini with a Rocket host; the exact FireSim build, matching generated headers and guest capacity remain unbound, and these source pins do not adopt gemmini-mlir as a baseline.
 
+## Primitive adapter numerical verification
+
+[verify_matmul_runtime.py](verify_matmul_runtime.py) links the audited adapter object into baremetal programs and executes them with an explicitly selected, source-bound Gemmini Spike plugin. It requires passing adapter and simulator build receipts, verifies their source/tool/header bindings before and after execution, and audits every executable section of the final ELFs for prohibited FSM instructions. The simulator builder lives in the comparison repository at `examples/gemmini/comparisons/tvm/build_simulator.py`.
+
+```sh
+python "$TVM_ROOT/apps/gemmini/verify_matmul_runtime.py" --adapter-receipt "$ADAPTER_BUILD/receipt.json" --simulator-receipt "$SIMULATOR_BUILD/receipt.json" \
+  --riscv-gcc "$RISCV_BIN/riscv64-unknown-elf-gcc" --spike "$RISCV_BIN/spike" --dtc "$SPIKE_SUPPORT/bin/dtc" \
+  --spike-library-dir "$SPIKE_SUPPORT/lib" --plugin "$SIMULATOR_BUILD/libgemmini.so" --output-dir "$BUILD_ROOT/matmul-runtime-check"
+```
+
+Set each path to the selected build/tool installation and use a fresh output directory. The checked suite covers 13 valid calls including K=131071, partial tiles, padded strides, input preservation, output guards, overwrite and retained outputs, plus 18 invalid calls and recovery. Missing-extension and deliberately wrong-oracle controls must fail. The numerical oracle uses independent int64 arithmetic. This is functional qualification of the separate C-library adapter; it establishes neither TVM graph integration, RTL bit-exactness, platform coherence nor timing.
+
 ## Bounded baremetal CPU proof
 
 [verify_baremetal_cpu.py](verify_baremetal_cpu.py) compiles a fixed FP32 matmul/add/ReLU Relax graph into RISC-V CPU operations and derives static calls/constants from its legalized bindings. It links machine-mode startup, HTIF console/exit and caller-owned buffers without guest libc, libtvm, a C++ runtime or heap. Eight calls across five inputs must match an independent scalar oracle exactly, preserve input/constant/previous-output bytes and buffer canaries, and recover from a null-input rejection. A deliberately incorrect oracle must produce a failing target exit. Dynamic shapes, other dtypes, tuple outputs and unlegalized graphs are rejected.
