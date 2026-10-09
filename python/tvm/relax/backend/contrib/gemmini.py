@@ -166,8 +166,10 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True):
     Gemmini's admission/primitive body has op_pattern=8 (opaque), so FuseOps does
     not group it with CPU operations and FuseTIR does not rewrite its envelope.
     This is fusion around a boundary, not fusion inside the accelerator schedule.
-    optimize=False supplies the scheduled/LegalizeOps baseline without folding
-    or fusion. The optimized path requires semantic input, rather than an already
+    Both paths inline legal operator-local pointwise buffers so padding does not
+    require a baremetal heap. optimize=False otherwise supplies the scheduled/
+    LegalizeOps baseline without constant folding or graph fusion. The optimized
+    path requires semantic input, rather than an already
     device-lowered module: generic FoldConstant may CPU-evaluate call_tir.
     Candidate search can pass its bound tile_i/tile_j without altering this order.
     """
@@ -193,12 +195,11 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True):
     mod = relax.transform.LegalizeOps()(lower(mod))
     if optimize:
         mod = tvm.transform.Sequential([relax.transform.AnnotateTIROpPattern(), relax.transform.FuseOps(fuse_opt_level=2), relax.transform.FuseTIR()])(mod)
-        mod = _inline_cpu_producers(mod)
-    return mod
+    return _inline_cpu_producers(mod)
 
 
 def _inline_cpu_producers(mod):
-    """Remove legal internal pointwise temporaries after CPU function fusion.
+    """Remove legal operator-local pointwise temporaries, including padding.
 
     A raw baremetal exporter has no implicit TVM workspace allocator. Inlining
     removes these intermediates through ordinary scheduling, not an allocation

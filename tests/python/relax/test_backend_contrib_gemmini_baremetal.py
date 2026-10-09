@@ -174,6 +174,27 @@ class StaticGraphTests(unittest.TestCase):
         self.assertFalse((self.root / "operators.o").exists())
         self.assertFalse((self.root / "graph.json").exists())
 
+    def test_baseline_maxpool_padding_does_not_require_a_guest_heap(self):
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+        value = relax.Var("x", relax.TensorStructInfo((1, 1, 64, 64), "int8"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [value]):
+            output = builder.emit(relax.op.nn.max_pool2d(value, pool_size=(3, 3), strides=(2, 2), padding=(1, 1)))
+            builder.emit_func_output(output)
+        prepared = prepare_gemmini_graph(builder.get(), optimize=False)
+        report, loaded, inputs, outputs, workspace = self.compile(prepared)
+        self.assertEqual(len(report["calls"]), 1)
+        self.assertNotIn("TVMBackendAllocWorkspace", (self.root / "operators.ll").read_text())
+        for offset in (0, 11):
+            image = ((np.arange(4096).reshape(1, 1, 64, 64) * 13 + offset) % 255 - 127).astype("int8")
+            inputs[0][:] = image
+            workspace.fill(0xA5)
+            self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+            padded = np.pad(image, ((0, 0), (0, 0), (1, 1), (1, 1)), constant_values=-128)
+            expected = np.lib.stride_tricks.sliding_window_view(padded, (3, 3), axis=(2, 3))[:, :, ::2, ::2].max(axis=(-1, -2))
+            np.testing.assert_array_equal(outputs[0], expected)
+            np.testing.assert_array_equal(inputs[0], image)
+
     def test_unused_multi_output_sibling_cannot_alias_live_result(self):
         report, loaded, inputs, outputs, workspace = self.compile(custom_graph(multi_output=True))
         first, second = report["intermediates"][:2]
