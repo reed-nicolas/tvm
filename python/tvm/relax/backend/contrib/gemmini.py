@@ -73,17 +73,20 @@ def _wrapper(m, n, k):
 
 @mutator
 class _MatmulLowerer(PyExprMutator):
-    def __init__(self, mod):
+    def __init__(self, mod, wrapper=_wrapper, name="gemmini_matmul", eligible=_eligible):
         super().__init__(mod)
         self.wrappers = {}
+        self.wrapper = wrapper
+        self.name = name
+        self.eligible = eligible
 
     def visit_call_(self, call):
         call = self.visit_expr_post_order(call)
-        shape = _eligible(call)
+        shape = self.eligible(call)
         if shape is None:
             return call
         if shape not in self.wrappers:
-            self.wrappers[shape] = self.builder_.add_func(_wrapper(*shape), "gemmini_matmul")
+            self.wrappers[shape] = self.builder_.add_func(self.wrapper(*shape), self.name)
         return self.builder_.normalize(relax.call_tir(self.wrappers[shape], tuple(call.args), call.struct_info))
 
     def visit_function_(self, func):
@@ -105,6 +108,43 @@ class LowerGemminiMatmul:
 
     def transform_module(self, mod, _ctx):
         lowerer = _MatmulLowerer(mod)
+        for gv, func in list(mod.functions_items()):
+            if isinstance(func, relax.Function):
+                lowerer.builder_.update_func(gv, lowerer.visit_expr(func))
+        return lowerer.builder_.get()
+
+
+@tvm.transform.module_pass(opt_level=0, name="LowerGemminiScheduledMatmul")
+class LowerGemminiScheduledMatmul:
+    """Opt-in static 2D matmul scheduling with genuine TensorIntrin substitution.
+
+    Run before LegalizeOps; unsupported operations keep their ordinary lowering.
+    This first integration converts matmul to call_tir before later FuseTIR, so
+    it does not claim fused-contraction scheduling or whole-graph paper fidelity.
+    gemmini_schedule exposes semantic construction and tensorization separately
+    for future graph/TIR integration before final intrinsic substitution.
+    Link the primitive C ABI with its pinned no-FSM hardware/header contract.
+    """
+
+    def __init__(self, tile_i=1, tile_j=1):
+        if any(type(x) is not int or x not in (1, 2, 4) for x in (tile_i, tile_j)):
+            raise ValueError("Gemmini macro tiles must be 1, 2 or 4")
+        self.tile_i = tile_i
+        self.tile_j = tile_j
+
+    def transform_module(self, mod, _ctx):
+        from .gemmini_schedule import make_gemmini_matmul  # pylint: disable=import-outside-toplevel
+
+        def wrapper(m, n, k):
+            return make_gemmini_matmul(m, n, k, self.tile_i, self.tile_j).scheduled_mod["main"].without_attr("global_symbol")
+
+        def eligible(call):
+            shape = _eligible(call)
+            if shape is not None and max(shape[2], shape[1] * 4) > (1 << 32) - 1:
+                return None
+            return shape
+
+        lowerer = _MatmulLowerer(mod, wrapper, "gemmini_scheduled_matmul", eligible)
         for gv, func in list(mod.functions_items()):
             if isinstance(func, relax.Function):
                 lowerer.builder_.update_func(gv, lowerer.visit_expr(func))
