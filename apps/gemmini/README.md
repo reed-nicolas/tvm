@@ -24,6 +24,7 @@ Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend c
 | Location | Integration responsibility |
 | --- | --- |
 | `python/tvm/relax/backend/contrib/gemmini.py` | Matmul admission, lowering and graph optimization around the device boundary. |
+| `python/tvm/relax/backend/contrib/gemmini_conv.py` | Semantic convolution packing, matmul decomposition and layout restoration. |
 | `python/tvm/relax/backend/contrib/gemmini_schedule.py` | Semantic tiled TIR, primitive tensorization and resource contracts. |
 | `python/tvm/relax/backend/contrib/gemmini_tuning.py` | Bounded candidates, structural features, correctness gates and learned ranking. |
 | `apps/gemmini/` | C primitives, static graph export and host/simulator verification recipes. |
@@ -88,9 +89,17 @@ Apply the pass before `LegalizeOps` and link the audited primitive adapter. Unsu
 
 ## Graph optimization around Gemmini
 
-`prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True)` accepts semantic Relax IR. It folds constants and canonicalizes bindings before device substitution, then legalizes and fuses surrounding CPU operations. Gemmini functions remain opaque; their admission checks and primitive schedule are preserved. Legal TIR `compute_inline` removes internal pointwise temporaries while retaining returned buffers. The exporter rejects remaining TVM allocator dependencies rather than assuming a guest runtime.
+`prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True)` accepts semantic Relax IR. It decomposes eligible integer convolutions, folds constants and canonicalizes bindings before device substitution, then legalizes and fuses surrounding CPU operations. Gemmini functions remain opaque; their admission checks and primitive schedule are preserved. Legal TIR `compute_inline` removes internal pointwise temporaries while retaining returned buffers. The exporter rejects remaining TVM allocator dependencies rather than assuming a guest runtime.
 
 `optimize=False` provides the scheduled/legalized baseline. Tests compare both paths against independent integer references through casts, bias, ReLU, clipping, shifts and tuple outputs, including extreme inputs and failure recovery. Frozen constants fold before accelerator IR exists; the optimized path rejects already device-lowered input because generic constant folding can CPU-evaluate `call_tir`. No affine quantization correction or through-device fusion is implied. The tested CPU graph shrinks from nine functions to two without changing its Gemmini body.
+
+## Primitive convolution decomposition
+
+`gemmini_conv.DecomposeGemminiConv2D()` admits positive static groups=1 NCHW/OIHW signed-int8 convolution with int32 output, supported CPU placement, nonnegative padding and positive stride/dilation. It creates compact CPU im2col and weight-packing operations, semantic Relax matmul and NCHW restoration. For `P=N*OH*OW`, `K=C*KH*KW` and `O=output_channels`, these tensors are `[P,K]`, `[K,O]` and `[P,O]`. The existing reduction and byte-span bounds apply. Unsupported operations and externally owned functions retain their original lowering.
+
+The graph pipeline applies decomposition before constant folding so fixed weight packing can fold before device scheduling. The resulting matmul uses the existing TVM primitive schedule and no-FSM C interface. Raw integer padding is zero; bias, affine zero-point corrections, activation and requantization remain explicit operations. Full im2col/product materialization needs whole-graph memory admission. `get_conv2d_contract(call)` supplies admitted shapes and individual tensor sizes, not a peak-memory or model-quantization claim.
+
+Run `python tests/python/relax/test_backend_contrib_gemmini_conv.py -v` in the activated environment. Six direct-script tests compare compiled semantics with independent int64 convolution over kernels 1/3/7, batches, rectangular/tail shapes, asymmetric padding, stride/dilation and extreme values. They also cover constant folding, limits and fallback. No separate convolution runtime or opaque vendor convolution is introduced.
 
 ## Bounded learned search
 

@@ -154,7 +154,8 @@ class LowerGemminiScheduledMatmul:
 def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True):
     """Prepare a semantic Relax graph while keeping device calls opaque.
 
-    The optimized path folds constants and canonicalizes bindings before Gemmini
+    Eligible integer convolutions first become explicit CPU packing/restoration
+    and semantic matmul. The optimized path folds constants and canonicalizes bindings before Gemmini
     substitution, then legalizes and fuses surrounding CPU operations. Internal
     pointwise producers are inlined by a TIR Schedule when it proves legality;
     returned buffers remain explicit. Fully
@@ -184,6 +185,10 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True):
                 tir.stmt_functor.post_order_visit(func.body, find_device)
         if device_calls:
             raise ValueError("Optimized Gemmini preparation requires a semantic graph before device lowering")
+    from .gemmini_conv import DecomposeGemminiConv2D  # pylint: disable=import-outside-toplevel
+
+    mod = DecomposeGemminiConv2D()(mod)
+    if optimize:
         mod = tvm.transform.Sequential([relax.transform.FoldConstant(), relax.transform.CanonicalizeBindings()])(mod)
     mod = relax.transform.LegalizeOps()(lower(mod))
     if optimize:
