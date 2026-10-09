@@ -14,7 +14,7 @@
 # "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Check a scheduled TVM matmul plus CPU add/ReLU graph in Gemmini Spike.
+"""Check scheduled TVM matmul or convolution/residual graphs in Gemmini Spike.
 
 This is a bounded compiler/runtime integration check, not a model or timing
 qualification. It reuses the pinned adapter/simulator receipt validation and
@@ -64,22 +64,47 @@ void __wrap_tvm_gemmini_compute(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint
   ++computes; if(!add) ++overwrites; __real_tvm_gemmini_compute(a,b,c,m,n,k,add);
 }
 void __wrap_tvm_gemmini_store(int32_t* p,uint32_t r,uint32_t m,uint32_t n) { ++stores; __real_tvm_gemmini_store(p,r,m,n); }
-struct input_buffer { uint8_t head[64]; int8_t value[M*K]; uint8_t tail[64]; };
-struct output_buffer { uint8_t head[64]; int32_t value[M*N]; uint8_t tail[64]; } __attribute__((aligned(64)));
+struct input_buffer { uint8_t head[64]; int8_t value[INPUT_ELEMENTS]; uint8_t tail[64]; };
+struct output_buffer { uint8_t head[64]; OUTPUT_TYPE value[M*N]; uint8_t tail[64]; } __attribute__((aligned(64)));
 struct workspace_buffer { uint8_t head[64]; uint8_t value[WORKSPACE_BYTES]; uint8_t tail[64]; };
 static struct input_buffer input __attribute__((aligned(64)));
 static struct output_buffer output[2] __attribute__((aligned(64)));
 static struct workspace_buffer workspace __attribute__((aligned(64)));
-static int32_t retained[M*N];
+static OUTPUT_TYPE retained[M*N];
+#if CONV
+struct raw_buffer { uint8_t head[64]; int32_t value[M*N]; uint8_t tail[64]; } __attribute__((aligned(64)));
+static struct raw_buffer raw[2] __attribute__((aligned(64)));
+static int32_t raw_retained[M*N];
+#endif
 extern const uint8_t model_constants[];
 static uint64_t hash(const void *p, uint64_t n) {
   const volatile uint8_t *bytes=p; uint64_t h=UINT64_C(1469598103934665603);
   for(uint64_t i=0;i<n;++i) h=(h^bytes[i])*UINT64_C(1099511628211); return h;
 }
+static int64_t contraction(unsigned row, unsigned col) {
+  int64_t value=0;
+#if CONV
+  int y=(int)(row/W), x=(int)(row%W);
+  for(unsigned channel=0;channel<CHANNELS;++channel)
+    for(unsigned ky=0;ky<KERNEL;++ky) for(unsigned kx=0;kx<KERNEL;++kx) {
+      int iy=y+(int)ky-PAD, ix=x+(int)kx-PAD;
+      if(iy>=0 && iy<H && ix>=0 && ix<W) {
+        unsigned weight=((col*CHANNELS+channel)*KERNEL+ky)*KERNEL+kx;
+        value+=(int64_t)input.value[(channel*H+iy)*W+ix]*((int)(weight*7%255)-127);
+      }
+    }
+#else
+  for(unsigned k=0;k<K;++k) value+=(int64_t)input.value[row*K+k]*((int)((k*N+col)*7%255)-127);
+#endif
+  return value;
+}
 static int guards(void) {
   for(unsigned i=0;i<64;++i) {
     if(input.head[i]!=0x6d || input.tail[i]!=0x6d || workspace.head[i]!=0x6d || workspace.tail[i]!=0x6d) return 0;
     for(unsigned b=0;b<2;++b) if(output[b].head[i]!=0x6d || output[b].tail[i]!=0x6d) return 0;
+#if CONV
+    for(unsigned b=0;b<2;++b) if(raw[b].head[i]!=0x6d || raw[b].tail[i]!=0x6d) return 0;
+#endif
   }
   return 1;
 }
@@ -87,8 +112,15 @@ int main(void) {
   for(unsigned i=0;i<64;++i) {
     input.head[i]=input.tail[i]=workspace.head[i]=workspace.tail[i]=0x6d;
     for(unsigned b=0;b<2;++b) output[b].head[i]=output[b].tail[i]=0x6d;
+#if CONV
+    for(unsigned b=0;b<2;++b) raw[b].head[i]=raw[b].tail[i]=0x6d;
+#endif
   }
+#if CONV
+  const void *inputs[1]={input.value}; void *outputs[2]={output[0].value,raw[0].value};
+#else
   const void *inputs[1]={input.value}; void *outputs[1]={output[0].value};
+#endif
   uint64_t constants_before=hash(model_constants,CONSTANT_BYTES);
   if(model_run(inputs,outputs,workspace.value,0)!=-1 || computes) return 10;
   inputs[0]=input.value+1;
@@ -98,22 +130,40 @@ int main(void) {
   puts_htif("GRAPH_INPUT_REJECTION_PASS\n");
   for(unsigned call=0;call<6;++call) {
     unsigned slot=call%2;
-    for(unsigned i=0;i<M*K;++i) input.value[i]=(int8_t)((int)((i*13+call*7)%256)-128);
-    for(unsigned i=0;i<M*N;++i) output[slot].value[i]=0x12345678;
+    for(unsigned i=0;i<INPUT_ELEMENTS;++i) input.value[i]=(int8_t)((int)((i*13+call*7)%256)-128);
+    for(unsigned i=0;i<M*N;++i) output[slot].value[i]=37;
+    for(unsigned i=0;i<WORKSPACE_BYTES;++i) workspace.value[i]=(uint8_t)(0xa5+call);
     uint64_t before=hash(input.value,sizeof(input.value));
     loads_a=loads_b=computes=stores=overwrites=0;
     outputs[0]=output[slot].value;
+#if CONV
+    outputs[1]=raw[slot].value;
+    for(unsigned i=0;i<M*N;++i) raw[slot].value[i]=0x12345678;
+#endif
     if(model_run(inputs,outputs,workspace.value,WORKSPACE_BYTES)) return 20;
     if(loads_a!=LOADS_A || loads_b!=LOADS_B || computes!=COMPUTES || stores!=STORES || overwrites!=STORES) return 21;
     for(unsigned row=0;row<M;++row) for(unsigned col=0;col<N;++col) {
-      int64_t expected=0;
-      for(unsigned k=0;k<K;++k) expected+=(int64_t)input.value[row*K+k]*((int)((k*N+col)*7%255)-127);
-      expected+=(int)col-9; if(expected<0) expected=0;
-      if(output[slot].value[row*N+col]!=expected+BAD_ORACLE) { puts_htif("GRAPH_NUMERICAL_FAILURE\n"); return 22; }
+      int64_t expected=contraction(row,col);
+#if CONV
+      unsigned index=col*M+row;
+      if(raw[slot].value[index]!=expected) { puts_htif("GRAPH_RAW_CONV_FAILURE\n"); return 27; }
+      expected+=(int)col-9+(int)input.value[index]*3-5;
+      expected=expected>=0 ? expected/512 : -((-expected+511)/512);
+      if(expected>127) expected=127;
+#else
+      unsigned index=row*N+col;
+      expected+=(int)col-9;
+#endif
+      if(expected<0) expected=0;
+      if(output[slot].value[index]!=expected+BAD_ORACLE) { puts_htif("GRAPH_NUMERICAL_FAILURE\n"); return 22; }
     }
     if(before!=hash(input.value,sizeof(input.value)) || constants_before!=hash(model_constants,CONSTANT_BYTES) || !guards()) return 23;
     if(call) for(unsigned i=0;i<M*N;++i) if(output[1-slot].value[i]!=retained[i]) return 24;
     for(unsigned i=0;i<M*N;++i) retained[i]=output[slot].value[i];
+#if CONV
+    if(call) for(unsigned i=0;i<M*N;++i) if(raw[1-slot].value[i]!=raw_retained[i]) return 28;
+    for(unsigned i=0;i<M*N;++i) raw_retained[i]=raw[slot].value[i];
+#endif
     if(model_run(inputs,outputs,workspace.value,0)!=-1) return 25;
   }
   extern uint64_t _stack_bottom[], _stack_top[];
@@ -140,11 +190,15 @@ def main():
     parser.add_argument("--tile-i", type=int, choices=(1, 2, 4))
     parser.add_argument("--tile-j", type=int, choices=(1, 2, 4))
     parser.add_argument("--graph-mode", choices=("baseline", "optimized"), default="baseline")
+    parser.add_argument("--workload", choices=("matmul", "conv-residual"), default="matmul")
+    parser.add_argument("--conv-kernel", type=int, choices=(1, 3, 7), help="Convolution fixture kernel size (default 3)")
     parser.add_argument("--search-seed", type=int, help="Execute a reproducible untrained search proposal; supplies no timing labels")
     parser.add_argument("--timeout-seconds", type=int, default=120)
     args = parser.parse_args()
     if not 1 <= args.timeout_seconds <= 300:
         parser.error("timeout must be in [1,300]")
+    if args.conv_kernel is not None and args.workload != "conv-residual":
+        parser.error("--conv-kernel requires --workload conv-residual")
     if args.search_seed is not None and (not 0 <= args.search_seed < (1 << 31) - 1 or args.tile_i is not None or args.tile_j is not None):
         parser.error("search seed must be in [0,2^31-2] and cannot be combined with explicit tiles")
     paths = {name: checked_path(value) for name, value in vars(args).items() if isinstance(value, Path)}
@@ -202,15 +256,21 @@ def main():
         report["compiler_library"] = bind(_LIB._name)
         report["build_info"] = dict(tvm.support.libinfo())
         report["source_head"] = command(["git", "-C", source, "rev-parse", "HEAD"], "source-head").strip()
-        for relative in ("python/tvm/relax/backend/contrib/gemmini.py", "python/tvm/relax/backend/contrib/gemmini_schedule.py"):
+        for relative in ("python/tvm/relax/backend/contrib/gemmini.py", "python/tvm/relax/backend/contrib/gemmini_schedule.py", "python/tvm/relax/backend/contrib/gemmini_conv.py"):
             bind(source / relative)
-        m, n, k = 17, 19, 33
+        convolution = args.workload == "conv-residual"
+        kernel = args.conv_kernel or 3
+        channels, height, width = 17, 7, 9
+        m, n, k = (height * width, channels, channels * kernel * kernel) if convolution else (17, 19, 33)
         search, proposal = None, None
         tile_i, tile_j = args.tile_i or 2, args.tile_j or 2
         if args.search_seed is not None:
             from tvm.relax.backend.contrib.gemmini_tuning import BoundedGemminiSearch
             bind(source / "python/tvm/relax/backend/contrib/gemmini_tuning.py")
             compiler_parts = [args.graph_mode, report["compiler_library"]["sha256"], report["exporter_source"]["sha256"], report["verifier_source"]["sha256"], report["compiler"]["sha256"], *[immutable[str(source / relative)] for relative in ("python/tvm/relax/backend/contrib/gemmini.py", "python/tvm/relax/backend/contrib/gemmini_schedule.py", "python/tvm/relax/backend/contrib/gemmini_tuning.py")]]
+            compiler_parts.append(immutable[str(source / "python/tvm/relax/backend/contrib/gemmini_conv.py")])
+            if convolution:
+                compiler_parts.extend([args.workload, kernel])
             compiler_id = hashlib.sha256(json.dumps(compiler_parts).encode()).hexdigest()
             search = BoundedGemminiSearch(m, n, k, seed=args.search_seed, compiler_id=compiler_id, adapter_id=report["adapter_object"]["sha256"])
             proposal = search.rank()[0]
@@ -221,14 +281,28 @@ def main():
                                        "compiler_id": compiler_id, "adapter_id": report["adapter_object"]["sha256"], "timing_samples": 0, "performance_winner": False}
         else:
             schedule = make_gemmini_matmul(m, n, k, tile_i, tile_j)
-        a = relax.Var("input", relax.TensorStructInfo((m, k), "int8"))
-        weights = ((np.arange(k*n).reshape(k, n)*7 % 255)-127).astype("int8")
+        input_shape = (1, channels, height, width) if convolution else (m, k)
+        weight_shape = (n, channels, kernel, kernel) if convolution else (k, n)
+        a = relax.Var("input", relax.TensorStructInfo(input_shape, "int8"))
+        weights = ((np.arange(k*n).reshape(weight_shape)*7 % 255)-127).astype("int8")
         builder = relax.BlockBuilder()
         with builder.function("main", [a]):
             with builder.dataflow():
-                value = builder.emit(relax.op.matmul(a, relax.const(weights), out_dtype="int32"))
-                value = builder.emit(relax.op.add(value, relax.const(np.arange(n, dtype="int32")-9)))
-                value = builder.emit_output(relax.op.nn.relu(value))
+                if convolution:
+                    residual = builder.emit(relax.op.astype(a, "int32"))
+                    residual = builder.emit(relax.op.multiply(residual, relax.const(3, "int32")))
+                    residual = builder.emit(relax.op.subtract(residual, relax.const(5, "int32")))
+                    raw_value = builder.emit(relax.op.nn.conv2d(a, relax.const(weights), padding=kernel // 2, data_layout="NCHW", kernel_layout="OIHW", out_dtype="int32"))
+                    value = builder.emit(relax.op.add(raw_value, relax.const((np.arange(n, dtype="int32")-9).reshape(1, n, 1, 1))))
+                    value = builder.emit(relax.op.add(value, residual))
+                    value = builder.emit(relax.op.right_shift(value, relax.const(9, "int32")))
+                    value = builder.emit(relax.op.clip(value, 0, 127))
+                    value = builder.emit(relax.op.astype(value, "int8"))
+                    value = builder.emit_output(relax.Tuple([value, raw_value]))
+                else:
+                    value = builder.emit(relax.op.matmul(a, relax.const(weights), out_dtype="int32"))
+                    value = builder.emit(relax.op.add(value, relax.const(np.arange(n, dtype="int32")-9)))
+                    value = builder.emit_output(relax.op.nn.relu(value))
             builder.emit_func_output(value)
         original = builder.get()
         (out / "input.relax.py").write_text(original.script(show_meta=True))
@@ -243,9 +317,17 @@ def main():
         (out / "schedule.tensorized.py").write_text(schedule.scheduled_mod.script())
         (out / "schedule.trace.json").write_text(json.dumps(schedule.trace.as_json(), indent=2) + "\n")
         graph = export_graph(lowered, out, memory_limit_bytes=1 << 20)
+        expected_outputs = [([1, n, height, width], "int8"), ([1, n, height, width], "int32")] if convolution else [([m, n], "int32")]
+        if [(item["shape"], item["dtype"]) for item in graph["outputs"]] != expected_outputs or [(item["shape"], item["dtype"]) for item in graph["inputs"]] != [(list(input_shape), "int8")]:
+            raise ValueError("exported fixture tensor ABI differs from the guest buffers")
         report["graph"] = graph
         report["graph_mode"] = args.graph_mode
-        if len(graph["calls"]) != (2 if args.graph_mode == "optimized" else 3):
+        report["workload"] = args.workload
+        if convolution:
+            report["convolution"] = {"input_shape": list(input_shape), "weight_shape": list(weight_shape), "padding": kernel // 2, "stride": 1, "dilation": 1, "groups": 1,
+                                     "epilogue": "int32 bias + (3*input - 5), floor divide by 512, clip [0,127], cast int8", "raw_output_checked": True,
+                                     "scope": "explicit diagnostic integer block; no ResNet quantization or quality policy selected"}
+        if not convolution and len(graph["calls"]) != (2 if args.graph_mode == "optimized" else 3):
             raise ValueError("fixture CPU fusion count differs from the selected graph mode")
         llvm_ir = (out / "operators.ll").read_text()
         if "@tvm_gemmini_compute(" not in llvm_ir or "@tvm_gemmini_matmul_i8_i32(" in llvm_ir:
@@ -254,7 +336,8 @@ def main():
         counters = {"LOADS_A": tiles_m*((tiles_n+tile_j-1)//tile_j)*tiles_k, "LOADS_B": tiles_n*((tiles_m+tile_i-1)//tile_i)*tiles_k, "COMPUTES": tiles_m*tiles_n*tiles_k, "STORES": tiles_m*tiles_n}
         report["schedule"] = {"tile_i": tile_i, "tile_j": tile_j, "expected_calls_per_invocation": counters, "metadata": schedule.metadata,
                               "lowering_steps": schedule.lowering_steps, "trace_scope": "TensorIntrin substitution from the generated tiled semantic template"}
-        fixture = {"M": m, "N": n, "K": k, "WORKSPACE_BYTES": graph["workspace_bytes"], "CONSTANT_BYTES": graph["constants_bytes"], **counters}
+        fixture = {"M": m, "N": n, "K": k, "INPUT_ELEMENTS": int(np.prod(input_shape)), "OUTPUT_TYPE": "int8_t" if convolution else "int32_t", "CONV": int(convolution),
+                   "CHANNELS": channels, "H": height, "W": width, "KERNEL": kernel, "PAD": kernel // 2, "WORKSPACE_BYTES": graph["workspace_bytes"], "CONSTANT_BYTES": graph["constants_bytes"], **counters}
         (out / "fixture.h").write_text("\n".join(f"#define {name} {value}" for name, value in fixture.items()) + "\n")
         for name, content in (("start.S", STARTUP), ("link.ld", LINKER), ("runner.c", RUNNER)):
             (out / name).write_text(content)
@@ -291,7 +374,7 @@ def main():
             raise ValueError("ELF load extent exceeds requested guest memory")
         if symbols["_stack_top"] - symbols["_stack_bottom"] != STACK_BYTES or symbols["_image_end"] > GUEST_BASE + GUEST_BYTES:
             raise ValueError("stack/image reservation mismatch")
-        if any(symbols[name] % 64 for name in ("model_constants", "input", "output", "workspace")):
+        if any(symbols[name] % 64 for name in ("model_constants", "input", "output", "workspace", *(("raw",) if convolution else ()))):
             raise ValueError("linked tensor storage is not aligned")
         report["memory"] = {"requested_guest_bytes": GUEST_BYTES, "load_segments": segments, "reserved_image_bytes": symbols["_image_end"] - GUEST_BASE,
                             "static_reservation_bytes": symbols["_stack_bottom"] - GUEST_BASE, "stack_reserved_bytes": STACK_BYTES,
@@ -323,7 +406,9 @@ def main():
                 raise ValueError("source/tool changed during verification")
         report["immutable_bindings"] = immutable
         report["artifacts"] = [identity(out / name) for name in ("model.c", "constants.bin", "constants.S", "operators.o", "fixture.h", "runner.c", "valid.elf", "bad-oracle.elf", "schedule.semantic.py", "schedule.tensorized.py", "schedule.trace.json")]
-        report["checks"].append({"name": "graph_runtime", "passed": True, "invocations": 6, "independent_i64_oracle": True, "primitive_counts_checked": True, "host_add_relu": True, "input_preservation": True, "constant_preservation": True, "retained_output": True, "elf_stack_bounds": True, "bad_oracle_exit": 22})
+        report["checks"].append({"name": "graph_runtime", "passed": True, "invocations": 6, "independent_i64_oracle": True, "primitive_counts_checked": True, "host_add_relu": not convolution,
+                                 "host_residual_requantization": convolution, "raw_convolution_output": convolution, "input_preservation": True, "constant_preservation": True,
+                                 "retained_output": True, "elf_stack_bounds": True, "bad_oracle_exit": 22})
         report.update(status="passed", device_execution=True)
     except Exception as error:
         report.update(status="failed", error=str(error))
