@@ -68,8 +68,10 @@ def get_type(elem_type: Union[str, int]) -> str:
         from onnx.mapping import (  # pylint: disable=import-outside-toplevel
             TENSOR_TYPE_TO_NP_TYPE,
         )
-    except ImportError as exception:
-        raise ImportError("Unable to import onnx which is required {}".format(exception))
+    except ImportError:
+        # ONNX 1.19 removed the legacy mapping module. The public helper
+        # returns the actual NumPy dtype; BF16's container exception is above.
+        return str(onnx.helper.tensor_dtype_to_np_dtype(elem_type))
 
     return str(TENSOR_TYPE_TO_NP_TYPE[elem_type])
 
@@ -645,6 +647,10 @@ class Sigmoid(OnnxOpConverter):
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
+        if inputs[0].struct_info.dtype == "bfloat16":
+            return relax.op.astype(
+                relax.op.sigmoid(relax.op.astype(inputs[0], "float32")), "bfloat16"
+            )
         return relax.op.sigmoid(inputs[0])
 
 
@@ -654,6 +660,13 @@ class Softmax(OnnxOpConverter):
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
         axis = attr.get("axis", -1)
+        if inputs[0].struct_info.dtype == "bfloat16":
+            # CPU BF16 softmax uses FP32 max/exp/sum arithmetic and rounds
+            # the probabilities at the BF16 result boundary.
+            return relax.op.astype(
+                relax.op.nn.softmax(relax.op.astype(inputs[0], "float32"), axis=axis),
+                "bfloat16",
+            )
         return relax.op.nn.softmax(inputs[0], axis=axis)
 
 
@@ -1249,6 +1262,21 @@ class Gelu(OnnxOpConverter):
     @classmethod
     def _impl_v1(cls, bb, inputs, attr, params):
         return relax.op.nn.gelu(inputs[0])
+
+    @classmethod
+    def _impl_v20(cls, bb, inputs, attr, params):
+        approximate = attr.get("approximate", b"none")
+        if isinstance(approximate, bytes):
+            approximate = approximate.decode("utf-8")
+        if approximate not in ("none", "tanh"):
+            raise ValueError("Gelu approximate must be none or tanh")
+        data = inputs[0]
+        bfloat16 = data.struct_info.dtype == "bfloat16"
+        if bfloat16:
+            data = relax.op.astype(data, "float32")
+        operation = relax.op.nn.gelu_tanh if approximate == "tanh" else relax.op.nn.gelu
+        result = operation(data)
+        return relax.op.astype(result, "bfloat16") if bfloat16 else result
 
 
 class FastGelu(OnnxOpConverter):

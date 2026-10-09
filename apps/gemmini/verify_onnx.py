@@ -28,7 +28,9 @@ import traceback
 
 
 BFLOAT_CASES = ("bfloat16_matmul", "bfloat16_gemm", "bfloat16_conv2d",
-               "bfloat16_conv2d_same_upper", "bfloat16_conv2d_same_lower", "bfloat16_layer_norm")
+               "bfloat16_conv2d_same_upper", "bfloat16_conv2d_same_lower", "bfloat16_layer_norm",
+               "bfloat16_softmax", "bfloat16_softmax_241", "bfloat16_gelu_none", "bfloat16_gelu_tanh",
+               "bfloat16_sigmoid")
 CASES = ("matmul", "batched_matmul", "conv2d", "layer_norm", "rms_norm")
 IMPORTER_CASES = ("shape_add", "gather_negative", "gather_negative_constant", "expand_leading_dims", "constant_of_shape_scalar",
                   "bfloat16_initializer", "bfloat16_constant", "bfloat16_cast")
@@ -97,6 +99,12 @@ def make_case(name, torch, np):
                 self.register_buffer("bias", parameter(bias_shape))
 
             def forward(self, value):
+                if name == "bfloat16_sigmoid":
+                    return torch.sigmoid(value)
+                if name.startswith("bfloat16_gelu"):
+                    return torch.nn.functional.gelu(value, approximate="tanh" if name.endswith("tanh") else "none")
+                if name.startswith("bfloat16_softmax"):
+                    return torch.nn.functional.softmax(value, dim=-1)
                 if name == "bfloat16_matmul":
                     return torch.matmul(value, self.weight)
                 if name == "bfloat16_gemm":
@@ -112,8 +120,16 @@ def make_case(name, torch, np):
 
         model = BFloatModel().eval()
         shape = (1, 2, 5, 19) if name.startswith("bfloat16_conv2d") else (2, 3, 17) if name == "bfloat16_layer_norm" else (3, 17)
+        if name.startswith("bfloat16_softmax"):
+            shape = (2, 3, 241 if name.endswith("241") else 17)
+        elif name == "bfloat16_sigmoid":
+            shape = (3, 257)
         value = rng.normal(0.2, 0.8, shape).astype("float32")
-        if name == "bfloat16_layer_norm":
+        if name == "bfloat16_sigmoid":
+            value += np.linspace(-16, 16, 257, dtype="float32")
+        if name.startswith("bfloat16_gelu"):
+            value += np.linspace(-4, 4, 17, dtype="float32")
+        if name == "bfloat16_layer_norm" or name.startswith("bfloat16_softmax"):
             # Offset rows exercise centered FP32 variance rather than the
             # cancellation-prone E[X^2]-E[X]^2 computation.
             value += np.array([[32, 100, -8], [128, -32, 2]], dtype="float32")[..., None]
