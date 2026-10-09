@@ -26,7 +26,7 @@ import unittest
 import numpy as np
 import tvm
 from tvm import relax, tir
-from tvm.relax.backend.contrib.gemmini import LowerGemminiMatmul, LowerGemminiScheduledMatmul
+from tvm.relax.backend.contrib.gemmini import LowerGemminiMatmul, LowerGemminiScheduledMatmul, prepare_gemmini_graph
 from tvm.relax.backend.contrib.gemmini_schedule import make_gemmini_matmul, make_semantic_matmul, tensorize_gemmini_matmul
 
 # This emulator interprets row-addressed primitive calls independently of TVM
@@ -139,6 +139,42 @@ def external_calls(func):
     return result
 
 
+def quantized_graph(a_value=None):
+    """Frozen weights, integer CPU transforms on both sides, three tuple outputs."""
+    m, n, k = 17, 19, 33
+    a = relax.Var("a", relax.TensorStructInfo((m, k), "int8"))
+    w = relax.Var("w", relax.TensorStructInfo((k, n), "int8"))
+    weight = ((np.arange(k * n).reshape(k, n) * 7 % 256) - 128).astype("int8")
+    bias = np.arange(n, dtype="int32") - 5
+    builder = relax.BlockBuilder()
+    with builder.function("main", [a, w]):
+        with builder.dataflow():
+            wide = builder.emit(relax.op.astype(a, "int32"))
+            offset = builder.emit(relax.op.add(wide, relax.const(np.int32(5))))
+            bounded = builder.emit(relax.op.clip(offset, -128, 127))
+            prepared = builder.emit(relax.op.astype(bounded, "int8"))
+            constant_weight = builder.emit(relax.op.add(w, relax.const(np.zeros_like(weight))))
+            product = builder.emit(relax.op.matmul(prepared, constant_weight, out_dtype="int32"))
+            biased = builder.emit(relax.op.add(product, relax.const(bias)))
+            activated = builder.emit(relax.op.nn.relu(biased))
+            clipped = builder.emit(relax.op.clip(activated, 0, 300))
+            shifted = builder.emit(relax.op.right_shift(clipped, relax.const(np.int32(3))))
+            quantized = builder.emit(relax.op.astype(shifted, "int8"))
+            output = builder.emit_output(relax.Tuple([quantized, product, prepared]))
+        builder.emit_func_output(output)
+    bindings = {"w": weight}
+    if a_value is not None:
+        bindings["a"] = a_value
+    return relax.transform.BindParams("main", bindings)(builder.get()), weight, bias
+
+
+def quantized_oracle(a, weight, bias):
+    prepared = np.clip(a.astype("int64") + 5, -128, 127).astype("int8")
+    product = prepared.astype("int64") @ weight.astype("int64")
+    quantized = (np.clip(np.maximum(product + bias.astype("int64"), 0), 0, 300) >> 3).astype("int8")
+    return quantized, product.astype("int32"), prepared
+
+
 class GemminiScheduleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="gemmini-schedule-", ignore_cleanup_errors=True)
@@ -160,6 +196,17 @@ class GemminiScheduleTests(unittest.TestCase):
             getattr(control, name).argtypes = [ctypes.c_int]
         control.emulator_reset()
         return tvm.runtime.load_module(str(path)), control, built.get_source("ll")
+
+    def build_graph(self, mod):
+        executable = relax.build(mod, "llvm")
+        self.index += 1
+        path = self.root / f"graph_{self.index}.so"
+        executable.export_library(str(path), addons=[str(self.emulator)], cc="cc", options=["-std=c11", "-I" + str(self.header)])
+        control = ctypes.CDLL(str(path))
+        for name in ("emulator_count", "emulator_fail", "emulator_wrong"):
+            getattr(control, name).argtypes = [ctypes.c_int]
+        control.emulator_reset()
+        return relax.VirtualMachine(tvm.runtime.load_module(str(path)), tvm.cpu()), control
 
     def check_run(self, scheduled, runtime, control, a, b):
         m, k = a.shape
@@ -201,7 +248,7 @@ class GemminiScheduleTests(unittest.TestCase):
                     self.assertNotIn("alloca", llvm)
                     calls = external_calls(scheduled.scheduled_mod["main"])
                     for call in calls:
-                        symbol = str(call.args[0])
+                        symbol = call.args[0].value
                         if symbol == "tvm_gemmini_compute":
                             self.assertEqual([str(arg.dtype) for arg in call.args[1:]], ["uint32"] * 6 + ["int32"])
                         if symbol in ("tvm_gemmini_load_a", "tvm_gemmini_load_b", "tvm_gemmini_store"):
@@ -304,6 +351,87 @@ class GemminiScheduleTests(unittest.TestCase):
         self.assertEqual(len(reference_primitives), 1)
         self.assertIn("tvm_gemmini_matmul_i8_i32", reference_primitives[0].script())
         self.assertNotIn("tvm_gemmini_compute", reference_primitives[0].script())
+
+    def test_graph_pipeline_frozen_weight_cpu_fusion_and_tuple_semantics(self):
+        original, weight, bias = quantized_graph()
+        original = original.with_attr("test_attribute", "preserved")
+        plans = [prepare_gemmini_graph(original, 2, 2, optimize=value) for value in (False, True)]
+        cpu_functions = []
+        boundaries = []
+        for mod in plans:
+            self.assertTrue(relax.analysis.well_formed(mod))
+            self.assertEqual(str(mod.attrs["test_attribute"]), "preserved")
+            primitives = [func for func in mod.functions.values() if isinstance(func, tir.PrimFunc)]
+            boundary = [func for func in primitives if any(call.args[0].value == "tvm_gemmini_compute" for call in external_calls(func))]
+            self.assertEqual(len(boundary), 1)
+            self.assertEqual(int(boundary[0].attrs["op_pattern"]), 8)
+            boundaries.append(boundary[0])
+            cpu_functions.append([func for func in primitives if func != boundary[0]])
+        self.assertEqual(len(cpu_functions[1]), 2)
+        self.assertGreater(len(cpu_functions[0]), len(cpu_functions[1]))
+        cpu_module = tvm.IRModule({gv: func.with_attr("global_symbol", gv.name_hint) for gv, func in plans[1].functions_items() if isinstance(func, tir.PrimFunc) and func != boundaries[1]})
+        cpu_llvm = tvm.build(cpu_module, "llvm").get_source("ll")
+        for gv in cpu_module.get_global_vars():
+            self.assertIn(str(gv.name_hint), cpu_llvm)
+        self.assertNotIn("TVMBackendAllocWorkspace", cpu_llvm)
+        self.assertNotIn("TVMBackendFreeWorkspace", cpu_llvm)
+        tvm.ir.assert_structural_equal(boundaries[0], boundaries[1], map_free_vars=True)
+        expected_body = make_gemmini_matmul(17, 19, 33, 2, 2).scheduled_mod["main"].body
+        tvm.ir.assert_structural_equal(boundaries[1].body, expected_body, map_free_vars=True)
+        calls = []
+        relax.analysis.post_order_visit(plans[1]["main"].body, lambda node: calls.append(node) if isinstance(node, relax.Call) and node.op == tvm.ir.Op.get("relax.call_tir") else None)
+        boundary_call = next(call for call in calls if plans[1][call.args[0]] == boundaries[1])
+        self.assertIsInstance(boundary_call.args[1].fields[1], relax.Constant)
+        np.testing.assert_array_equal(boundary_call.args[1].fields[1].data.numpy(), weight)
+
+        for mod in plans:
+            vm, control = self.build_graph(mod)
+            retained = None
+            for a in (((np.arange(17 * 33).reshape(17, 33) % 256) - 128).astype("int8"), np.full((17, 33), -128, "int8"), np.full((17, 33), 127, "int8")):
+                device_a = tvm.nd.array(a)
+                control.emulator_reset()
+                outputs = vm["main"](device_a)
+                for actual, expected in zip(outputs, quantized_oracle(a, weight, bias)):
+                    self.assertEqual(actual.dtype, str(expected.dtype))
+                    np.testing.assert_array_equal(actual.numpy(), expected)
+                np.testing.assert_array_equal(device_a.numpy(), a)
+                self.assertEqual([control.emulator_count(i) for i in range(7)], [1, 1, 6, 6, 12, 4, 1])
+                self.assertEqual((control.emulator_faults(), control.emulator_active()), (0, 0))
+                if retained is None:
+                    retained = [(value, value.numpy()) for value in outputs]
+                else:
+                    for value, saved in retained:
+                        np.testing.assert_array_equal(value.numpy(), saved)
+            control.emulator_reset()
+            control.emulator_fail(-5)
+            with self.assertRaisesRegex(tvm.error.TVMError, "scheduled matmul rejected"):
+                vm["main"](tvm.nd.array(np.zeros((17, 33), "int8")))
+            self.assertEqual([control.emulator_count(i) for i in range(7)], [1, 0, 0, 0, 0, 0, 0])
+            control.emulator_reset()
+            recovery = np.zeros((17, 33), "int8")
+            for actual, expected in zip(vm["main"](tvm.nd.array(recovery)), quantized_oracle(recovery, weight, bias)):
+                np.testing.assert_array_equal(actual.numpy(), expected)
+
+    def test_graph_pipeline_constant_only_folds_before_device_lowering(self):
+        a = ((np.arange(17 * 33).reshape(17, 33) % 256) - 128).astype("int8")
+        original, weight, bias = quantized_graph(a)
+        optimized = prepare_gemmini_graph(original, 2, 2)
+        self.assertTrue(relax.analysis.well_formed(optimized))
+        self.assertEqual(len(optimized["main"].params), 0)
+        self.assertFalse(any(isinstance(func, tir.PrimFunc) for func in optimized.functions.values()))
+        vm, control = self.build_graph(optimized)
+        for actual, expected in zip(vm["main"](), quantized_oracle(a, weight, bias)):
+            np.testing.assert_array_equal(actual.numpy(), expected)
+        self.assertEqual([control.emulator_count(i) for i in range(7)], [0] * 7)
+
+    def test_graph_pipeline_rejects_device_input_before_constant_evaluation(self):
+        semantic = graph()
+        for device in (LowerGemminiScheduledMatmul()(semantic), LowerGemminiMatmul()(semantic)):
+            with self.assertRaisesRegex(ValueError, "semantic graph before device lowering"):
+                prepare_gemmini_graph(device)
+        for kwargs in ({"tile_i": 8}, {"optimize": 1}):
+            with self.assertRaises(ValueError):
+                prepare_gemmini_graph(semantic, **kwargs)
 
 
 if __name__ == "__main__":

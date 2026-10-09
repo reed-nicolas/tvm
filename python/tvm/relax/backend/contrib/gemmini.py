@@ -136,7 +136,7 @@ class LowerGemminiScheduledMatmul:
         from .gemmini_schedule import make_gemmini_matmul  # pylint: disable=import-outside-toplevel
 
         def wrapper(m, n, k):
-            return make_gemmini_matmul(m, n, k, self.tile_i, self.tile_j).scheduled_mod["main"].without_attr("global_symbol")
+            return make_gemmini_matmul(m, n, k, self.tile_i, self.tile_j).scheduled_mod["main"].without_attr("global_symbol").with_attr("op_pattern", 8)
 
         def eligible(call):
             shape = _eligible(call)
@@ -149,3 +149,82 @@ class LowerGemminiScheduledMatmul:
             if isinstance(func, relax.Function):
                 lowerer.builder_.update_func(gv, lowerer.visit_expr(func))
         return lowerer.builder_.get()
+
+
+def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True):
+    """Prepare a semantic Relax graph while keeping device calls opaque.
+
+    The optimized path folds constants and canonicalizes bindings before Gemmini
+    substitution, then legalizes and fuses surrounding CPU operations. Internal
+    pointwise producers are inlined by a TIR Schedule when it proves legality;
+    returned buffers remain explicit. Fully
+    constant matmuls can fold on the CPU before any device IR exists. The signed
+    int8/int32 contraction and separate bias, clipping, casts and shifts retain
+    their original graph order; no affine quantization correction is invented.
+
+    Gemmini's admission/primitive body has op_pattern=8 (opaque), so FuseOps does
+    not group it with CPU operations and FuseTIR does not rewrite its envelope.
+    This is fusion around a boundary, not fusion inside the accelerator schedule.
+    optimize=False supplies the scheduled/LegalizeOps baseline without folding
+    or fusion. The optimized path requires semantic input, rather than an already
+    device-lowered module: generic FoldConstant may CPU-evaluate call_tir.
+    Candidate search can pass its bound tile_i/tile_j without altering this order.
+    """
+    lower = LowerGemminiScheduledMatmul(tile_i, tile_j)
+    if type(optimize) is not bool:
+        raise ValueError("optimize must be a boolean")
+    if optimize:
+        device_calls = []
+        for func in mod.functions.values():
+            if isinstance(func, tir.PrimFunc):
+                def find_device(node):
+                    if isinstance(node, tir.Call) and node.op == tvm.ir.Op.get("tir.call_extern") and isinstance(node.args[0], tir.StringImm) and node.args[0].value.startswith("tvm_gemmini_"):
+                        device_calls.append(node)
+
+                tir.stmt_functor.post_order_visit(func.body, find_device)
+        if device_calls:
+            raise ValueError("Optimized Gemmini preparation requires a semantic graph before device lowering")
+        mod = tvm.transform.Sequential([relax.transform.FoldConstant(), relax.transform.CanonicalizeBindings()])(mod)
+    mod = relax.transform.LegalizeOps()(lower(mod))
+    if optimize:
+        mod = tvm.transform.Sequential([relax.transform.AnnotateTIROpPattern(), relax.transform.FuseOps(fuse_opt_level=2), relax.transform.FuseTIR()])(mod)
+        mod = _inline_cpu_producers(mod)
+    return mod
+
+
+def _inline_cpu_producers(mod):
+    """Remove legal internal pointwise temporaries after CPU function fusion.
+
+    A raw baremetal exporter has no implicit TVM workspace allocator. Inlining
+    removes these intermediates through ordinary scheduling, not an allocation
+    override. Remaining unsupported allocations require downstream runtime
+    support or rejection. Accelerator envelopes are never scheduled here.
+    """
+    for gv, func in list(mod.functions_items()):
+        if not isinstance(func, tir.PrimFunc) or not isinstance(func.body, tir.BlockRealize):
+            continue
+        if func.attrs and int(func.attrs.get("op_pattern", -1)) == 8:
+            continue
+        internal = {buffer.data for buffer in func.body.block.alloc_buffers}
+        parameters = {buffer.data for buffer in func.buffer_map.values()}
+        candidates = []
+
+        def find_producer(node):
+            if isinstance(node, tir.Block) and node.init is None and isinstance(node.body, tir.BufferStore) and len(node.writes) == 1:
+                data = node.writes[0].buffer.data
+                if data in internal and data not in parameters and all(axis.iter_type == tir.IterVar.DataPar for axis in node.iter_vars):
+                    candidates.append(node.name_hint)
+
+        tir.stmt_functor.post_order_visit(func.body, find_producer)
+        if not candidates:
+            continue
+        schedule = tir.Schedule(tvm.IRModule({gv: func}), debug_mask=1)
+        for name in candidates:
+            try:
+                schedule.compute_inline(schedule.get_block(name, func_name=gv.name_hint))
+            except tir.schedule.ScheduleError:
+                # Reduction/non-complete/otherwise illegal producers stay in
+                # TIR. A downstream exporter must account for their memory.
+                continue
+        mod.update_func(gv, schedule.mod[gv])
+    return mod
