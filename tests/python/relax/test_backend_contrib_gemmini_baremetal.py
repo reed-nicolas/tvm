@@ -54,6 +54,34 @@ def graph(dtype="int8", tuple_output=False, shape=(2, 3)):
     return relax.transform.LegalizeOps()(builder.get())
 
 
+def custom_graph(*, alignment=64, multi_output=False, attribute=None, storage_alignment=None):
+    buffers = [tir.decl_buffer((8,), "int32", name=name, data_alignment=alignment) for name in ("x", "dead", "live")]
+    x, dead, live = buffers
+    index = tir.Var("i", "int32")
+    def write(buffer, amount):
+        body = tir.BufferStore(buffer, tir.BufferLoad(x, [index]) + amount, [index])
+        return tir.For(index, 0, 8, tir.ForKind.SERIAL, body)
+    selected = buffers if multi_output else [x, live]
+    body = tir.SeqStmt([write(live, 11), write(dead, -37)]) if multi_output else write(live, 11)
+    if storage_alignment is not None:
+        body = tir.AttrStmt(x.data, "storage_alignment", storage_alignment, body)
+    primitive = tir.PrimFunc([buffer.data for buffer in selected], body,
+                            buffer_map={buffer.data: buffer for buffer in selected}).with_attr("tir.noalias", True)
+    if attribute:
+        primitive = primitive.with_attr(*attribute)
+    value = relax.Var("x", relax.TensorStructInfo((8,), "int32"))
+    builder = relax.BlockBuilder()
+    gv = builder.add_func(primitive, "producer")
+    with builder.function("main", [value]):
+        with builder.dataflow():
+            info = relax.TensorStructInfo((8,), "int32")
+            result = builder.emit(relax.call_tir(gv, [value], [info, info] if multi_output else info))
+            live_result = builder.emit(relax.TupleGetItem(result, 1)) if multi_output else result
+            output = builder.emit_output(relax.op.add(live_result, relax.const(1, "int32")))
+        builder.emit_func_output(output)
+    return relax.transform.LegalizeOps()(builder.get())
+
+
 class StaticGraphTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="gemmini-static-graph-")
@@ -121,6 +149,24 @@ class StaticGraphTests(unittest.TestCase):
         expected = (inputs[0] @ (np.arange(12, dtype="float32").reshape(3, 4) - 5) + 3) * 2 - 1
         np.testing.assert_array_equal(outputs[0], expected)
         self.assertLess(len(report["calls"]), 4)
+
+    def test_unused_multi_output_sibling_cannot_alias_live_result(self):
+        report, loaded, inputs, outputs, workspace = self.compile(custom_graph(multi_output=True))
+        first, second = report["intermediates"][:2]
+        inputs[0][:] = np.arange(8, dtype="int32")
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+        np.testing.assert_array_equal(outputs[0], inputs[0] + 12)
+        self.assertNotEqual(first["offset"], second["offset"])
+
+    def test_stronger_external_alignment_is_rejected(self):
+        for mod in (custom_graph(alignment=128), custom_graph(storage_alignment=128)):
+            with self.subTest(), self.assertRaisesRegex(ValueError, "alignment"):
+                plan_graph(mod)
+
+    def test_unsupported_function_abi_and_target_are_rejected(self):
+        for attribute in (("calling_conv", 1), ("calling_conv", 2), ("target", tvm.target.Target("cuda -arch=sm_50"))):
+            with self.subTest(attribute=attribute), self.assertRaisesRegex(ValueError, "calling convention|target"):
+                plan_graph(custom_graph(attribute=attribute))
 
     def test_unknown_shapes_dtypes_and_memory_are_rejected(self):
         for mod in (graph(dtype="float64"), graph(shape=(tir.Var("batch", "int64"), 3))):

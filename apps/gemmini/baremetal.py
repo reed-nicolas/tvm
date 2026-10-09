@@ -19,6 +19,9 @@ Graph optimization and accelerator scheduling must precede export. This module
 only derives calls, constants and buffer lifetimes; it does not implement tensor
 operators. Unsupported control flow, dynamic tensors and hidden scalar ABIs fail
 explicitly. The caller supplies aligned, disjoint input/output/workspace storage.
+Each call_tir operator must synchronously complete its outputs, preserve inputs
+and constants, and retain no buffer pointers after return. These are compiler/
+operator contracts, not a static proof of arbitrary TIR or external-call effects.
 """
 
 from dataclasses import dataclass
@@ -67,7 +70,7 @@ def _tensor(info, name, origin, birth=-1):
         raise ValueError("tensor dimensions must be positive static integers")
     if info.vdevice is not None and info.vdevice.target.kind.name not in ("llvm", "c"):
         raise ValueError("only host-addressed tensor buffers are supported")
-    result = Tensor(name, tuple(int(d) for d in info.shape), info.dtype, origin, birth)
+    result = Tensor(name, tuple(int(d) for d in info.shape), info.dtype, origin, birth=birth, last_use=birth)
     if result.nbytes > (1 << 63) - 1:
         raise ValueError("tensor byte extent overflows the target pointer ABI")
     return result
@@ -172,6 +175,10 @@ def plan_graph(mod):
             primitive = mod[gv]
             if not isinstance(primitive, tir.PrimFunc) or len(primitive.params) != len(primitive.buffer_map):
                 raise ValueError("PrimFunc requires an unsupported scalar or hidden workspace ABI")
+            if primitive.attrs and int(primitive.attrs.get("calling_conv", 0)) != 0:
+                raise ValueError("PrimFunc requires the default calling convention")
+            if primitive.attrs and "target" in primitive.attrs:
+                raise ValueError("PrimFunc target must be supplied by the exporter")
             actual_inputs = [resolve(arg) for arg in arguments.fields]
             if any(not isinstance(arg, Tensor) for arg in actual_inputs):
                 raise ValueError("call_tir operands must be individual tensors")
@@ -187,6 +194,14 @@ def plan_graph(mod):
                     raise ValueError("only compact zero-offset PrimFunc buffers are supported")
                 if buffer.scope() != "global":
                     raise ValueError("PrimFunc parameters must use host-addressed storage")
+                if buffer.data_alignment <= 0 or ALIGNMENT % buffer.data_alignment:
+                    raise ValueError("PrimFunc external-buffer alignment exceeds the storage guarantee")
+            external_data = {buffer.data for buffer in primitive.buffer_map.values()}
+            def check_alignment(node):
+                if isinstance(node, tir.AttrStmt) and node.attr_key == "storage_alignment" and node.node in external_data:
+                    if not isinstance(node.value, tir.IntImm) or int(node.value) <= 0 or ALIGNMENT % int(node.value):
+                        raise ValueError("PrimFunc external-buffer storage alignment exceeds the storage guarantee")
+            tir.stmt_functor.post_order_visit(primitive.body, check_alignment)
             for tensor in actual_inputs:
                 tensor.last_use = len(calls)
             values[binding.var] = result
