@@ -21,15 +21,15 @@ under the License.
 
 Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter and a bounded TVM-scheduled graph pass numerical checks in the pinned functional simulator. Full-model device execution, pretrained qualification and target timing remain pending.
 
-| Future location | Integration responsibility |
+| Location | Integration responsibility |
 | --- | --- |
-| `python/tvm/relax/backend/contrib/gemmini.py` | Implemented static integer matmul admission and external-call lowering; broader numerical/layout eligibility and fusion remain future work. |
-| `src/relax/backend/contrib/gemmini/` | Emit Gemmini C-library wrappers, specialized objects and symbol bindings while preserving partition semantics. |
-| `src/runtime/contrib/gemmini/` | TVM values/calling convention, buffer lifetimes, packing/workspace, dispatch, synchronization and result visibility. |
-| `cmake/modules/contrib/Gemmini.cmake` | Optional codegen/runtime build wiring; no build module is installed. |
-| `tests/python/relax/test_backend_contrib_gemmini.py` | Implemented host-reference admission, rejection, generated-call, control-flow and error-propagation checks; device checks remain future work. |
+| `python/tvm/relax/backend/contrib/gemmini.py` | Matmul admission, lowering and graph optimization around the device boundary. |
+| `python/tvm/relax/backend/contrib/gemmini_schedule.py` | Semantic tiled TIR, primitive tensorization and resource contracts. |
+| `python/tvm/relax/backend/contrib/gemmini_tuning.py` | Bounded candidates, structural features, correctness gates and learned ranking. |
+| `apps/gemmini/` | C primitives, static graph export and host/simulator verification recipes. |
+| `tests/python/relax/test_backend_contrib_gemmini*.py` | Focused admission, scheduling, graph, export and search regressions. |
 
-`apps/gemmini/` holds the host verifier and will hold standalone integration examples and build/run documentation as implementation becomes available. `verify_host.py` verifies checkout identity, LLVM code generation and CPU execution against NumPy, and records loaded-library/build identity. Use `examples/gemmini/comparisons/tvm/HOST_SETUP.md` in the parent comparison repository for the pinned environment, host verification commands and provenance.
+`verify_host.py` verifies checkout identity, LLVM code generation and CPU execution against NumPy, and records loaded-library/build identity. Use `examples/gemmini/comparisons/tvm/HOST_SETUP.md` in the parent comparison repository for the pinned environment, host verification commands and provenance.
 
 The host recipe opts into `USE_HOST_ONLY_AUTO_COPY_GUARD` (OFF by default) because this checkout lacks the `LowerAutoCopy` implementation required by existing driver/MetaSchedule callers. `auto_copy_guard.cc` preserves unannotated IR and rejects automatic-copy markers; it is a validation-only pass, supplies no optimization, and must not coexist with the full implementation. The host verifier checks preservation and rejection through direct calls and ordinary `tvm.build`; record this local patch and enabled mode with the base commit.
 
@@ -92,6 +92,14 @@ Apply the pass before `LegalizeOps` and link the audited primitive adapter. Unsu
 
 `optimize=False` provides the scheduled/legalized baseline. Tests compare both paths against independent integer references through casts, bias, ReLU, clipping, shifts and tuple outputs, including extreme inputs and failure recovery. Frozen constants fold before accelerator IR exists; the optimized path rejects already device-lowered input because generic constant folding can CPU-evaluate `call_tir`. No affine quantization correction or through-device fusion is implied. The tested CPU graph shrinks from nine functions to two without changing its Gemmini body.
 
+## Bounded learned search
+
+`gemmini_tuning.BoundedGemminiSearch(M, N, K, seed=0, compiler_id=..., adapter_id=...)` enumerates the nine legal macro-tile choices. TVM MetaSchedule's `PerStoreFeature` observes mathematical TIR before tensorization, and `XGBModel` learns rankings from accepted repeated measurements. Candidate identities bind semantic/device IR, trace, metadata and caller-supplied build identities; mutation invalidates the binding. This is a bounded template search, not a general schedule explorer.
+
+Use `rank()` to obtain proposals and `schedule_for(candidate_id)` to obtain the bound schedule. Pass its tile metadata to `prepare_gemmini_graph`; the verifier checks the resulting device body matches exactly. `validate_semantics` checks independent CPU mathematics. `record_device_check` separately records the candidate's functional result on an identified platform. `update([TimingRecord(...)])` accepts a list of records with at least two finite positive seconds, consistent workload/build/platform/protocol identities and both correctness gates. These caller declarations enforce consistency, not authenticity. Updates retrain cumulatively and preserve the prior model/ledger if fitting or prediction fails; `manifest()` records provenance and checks.
+
+Without measurements, rankings are seeded untrained proposals. Synthetic training requires `allow_diagnostic=True` and labels every resulting proposal diagnostic. Neither predictions nor functional Spike evidence establish a performance winner. Tested optional dependencies are `xgboost==1.7.6` and `pytest==8.3.5`; ordinary compilation and untrained proposals do not require them. Run `python -m pytest -c /dev/null -p no:cacheprovider tests/python/relax/test_backend_contrib_gemmini_tuning.py -q` in the activated environment. Eight tests cover distinct features, semantic/tail correctness, reproducible actual XGB updates, graph application and invalid provenance/mutations/failures. Genuine target measurements and selection remain pending.
+
 ## Primitive adapter numerical verification
 
 The header also exposes CPU-only whole-operation validation and `begin`, `load_a`, `load_b`, `compute`, `store` and `end` primitives for compiler-generated schedules. TVM supplies plain scratchpad/accumulator row allocations, tile extents and reduction ordering; these wrappers only configure the device and emit vendor-library primitive instructions. Validate all user buffers before `begin`, keep A/B immutable through `end`, and prove the row/dimension contract in [matmul.h](matmul.h). Each compute restarts a reduction of at most 16 products in the signed20 PE; later chunks add into int32 accumulator SRAM. First-chunk overwrite and subsequent accumulation are distinct operations. The adapter verifier retains and audits every public primitive, including uncalled ones; never link the raw object containing unused vendor FSM code.
@@ -143,5 +151,7 @@ python "$TVM_ROOT/apps/gemmini/verify_graph.py" --tvm-source "$TVM_ROOT" --tvm-b
 ```
 
 Use matching adapter/simulator receipts and a fresh output directory. Both 1×1 and 2×2 schedules pass: A/B loads each fall from twelve to six, while computation and outputs are unchanged. The receipt retains semantic/tensorized IR, a replayable substitution trace, tool/source identities, final ELF bounds and a painted-stack high-water observation. The requested generic Spike map is 256 MiB; this does not establish deployed capacity. No full-model, timing or actual-platform coherence qualification is implied.
+
+Add `--graph-mode optimized` to fold constants and fuse CPU operations around Gemmini. The baseline and optimized fixtures both pass exact functional checks; calls shrink from three to two and explicit workspace from 2,688 to 1,344 bytes. Replace both tile options with `--search-seed 7` to execute an untrained search proposal through the optimized graph. This mode binds the candidate to the actual compiler/adapter and generated device IR, then records its functional simulator gate after all controls pass. It supplies zero timing labels and selects no performance winner; trained diagnostic proposal application is covered separately by the search tests.
 
 The model order is canonical ResNet50, TinyLlama 1B, then SmolVLA. Prove small matmul and convolution cases using the selected target's arithmetic before full-model device execution. The proposed signed-int8/int32 contract requires matching hardware and generated headers; it does not apply to a floating-point configuration. Keep model inputs and quality thresholds fixed through performance tuning; functional simulator evidence and qualified timing evidence serve distinct roles. Final comparison timing comes from FireSim, with platform and capture details coordinated by the comparison team. Keep full-model inputs, comparisons and measurement orchestration in the parent comparison repository. Build products, environments, model weights, captures and outputs stay outside this source tree, using the parent's configured `out/build/baselines/tvm-gemmini/` and other `out/` roots.

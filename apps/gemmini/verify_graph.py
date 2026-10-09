@@ -23,6 +23,7 @@ contains only independent expected-value checks and primitive-call counters.
 """
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -136,12 +137,16 @@ def main():
     names = ("tvm-source", "tvm-build", "adapter-receipt", "simulator-receipt", "riscv-gcc", "spike", "dtc", "spike-library-dir", "plugin", "output-dir")
     for name in names:
         parser.add_argument("--" + name, required=True, type=Path)
-    parser.add_argument("--tile-i", type=int, choices=(1, 2, 4), default=2)
-    parser.add_argument("--tile-j", type=int, choices=(1, 2, 4), default=2)
+    parser.add_argument("--tile-i", type=int, choices=(1, 2, 4))
+    parser.add_argument("--tile-j", type=int, choices=(1, 2, 4))
+    parser.add_argument("--graph-mode", choices=("baseline", "optimized"), default="baseline")
+    parser.add_argument("--search-seed", type=int, help="Execute a reproducible untrained search proposal; supplies no timing labels")
     parser.add_argument("--timeout-seconds", type=int, default=120)
     args = parser.parse_args()
     if not 1 <= args.timeout_seconds <= 300:
         parser.error("timeout must be in [1,300]")
+    if args.search_seed is not None and (not 0 <= args.search_seed < (1 << 31) - 1 or args.tile_i is not None or args.tile_j is not None):
+        parser.error("search seed must be in [0,2^31-2] and cannot be combined with explicit tiles")
     paths = {name: checked_path(value) for name, value in vars(args).items() if isinstance(value, Path)}
     out = paths["output_dir"]
     out.mkdir(parents=True, exist_ok=False)
@@ -189,7 +194,7 @@ def main():
         import tvm
         from tvm import relax
         from tvm._ffi.base import _LIB
-        from tvm.relax.backend.contrib.gemmini import LowerGemminiScheduledMatmul
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
         from tvm.relax.backend.contrib.gemmini_schedule import make_gemmini_matmul
         from baremetal import export_graph
         if checked_path(tvm.__file__).parent != source / "python/tvm" or checked_path(_LIB._name).parent != build:
@@ -200,6 +205,22 @@ def main():
         for relative in ("python/tvm/relax/backend/contrib/gemmini.py", "python/tvm/relax/backend/contrib/gemmini_schedule.py"):
             bind(source / relative)
         m, n, k = 17, 19, 33
+        search, proposal = None, None
+        tile_i, tile_j = args.tile_i or 2, args.tile_j or 2
+        if args.search_seed is not None:
+            from tvm.relax.backend.contrib.gemmini_tuning import BoundedGemminiSearch
+            bind(source / "python/tvm/relax/backend/contrib/gemmini_tuning.py")
+            compiler_parts = [args.graph_mode, report["compiler_library"]["sha256"], report["exporter_source"]["sha256"], report["verifier_source"]["sha256"], report["compiler"]["sha256"], *[immutable[str(source / relative)] for relative in ("python/tvm/relax/backend/contrib/gemmini.py", "python/tvm/relax/backend/contrib/gemmini_schedule.py", "python/tvm/relax/backend/contrib/gemmini_tuning.py")]]
+            compiler_id = hashlib.sha256(json.dumps(compiler_parts).encode()).hexdigest()
+            search = BoundedGemminiSearch(m, n, k, seed=args.search_seed, compiler_id=compiler_id, adapter_id=report["adapter_object"]["sha256"])
+            proposal = search.rank()[0]
+            search.validate_semantics(proposal.candidate.candidate_id)
+            schedule = search.schedule_for(proposal.candidate.candidate_id)
+            tile_i, tile_j = schedule.metadata["tile_i"], schedule.metadata["tile_j"]
+            report["search_proposal"] = {"candidate_id": proposal.candidate.candidate_id, "workload_id": search.workload_id, "origin": proposal.origin,
+                                       "compiler_id": compiler_id, "adapter_id": report["adapter_object"]["sha256"], "timing_samples": 0, "performance_winner": False}
+        else:
+            schedule = make_gemmini_matmul(m, n, k, tile_i, tile_j)
         a = relax.Var("input", relax.TensorStructInfo((m, k), "int8"))
         weights = ((np.arange(k*n).reshape(k, n)*7 % 255)-127).astype("int8")
         builder = relax.BlockBuilder()
@@ -211,24 +232,27 @@ def main():
             builder.emit_func_output(value)
         original = builder.get()
         (out / "input.relax.py").write_text(original.script(show_meta=True))
-        scheduled = LowerGemminiScheduledMatmul(tile_i=args.tile_i, tile_j=args.tile_j)(original)
-        schedule = make_gemmini_matmul(m, n, k, args.tile_i, args.tile_j)
-        primitives = [func for _, func in scheduled.functions_items() if isinstance(func, tvm.tir.PrimFunc)]
+        lowered = prepare_gemmini_graph(original, tile_i=tile_i, tile_j=tile_j, optimize=args.graph_mode == "optimized")
+        primitives = [func for _, func in lowered.functions_items() if isinstance(func, tvm.tir.PrimFunc) and func.attrs and "gemmini.m" in func.attrs]
         if len(primitives) != 1:
             raise ValueError("expected exactly one scheduled graph primitive")
-        tvm.ir.assert_structural_equal(primitives[0].without_attr("global_symbol"), schedule.scheduled_mod["main"].without_attr("global_symbol"))
+        actual = primitives[0].without_attr("global_symbol").without_attr("op_pattern")
+        expected = schedule.scheduled_mod["main"].without_attr("global_symbol").without_attr("op_pattern")
+        tvm.ir.assert_structural_equal(actual, expected)
         (out / "schedule.semantic.py").write_text(schedule.semantic_mod.script())
         (out / "schedule.tensorized.py").write_text(schedule.scheduled_mod.script())
         (out / "schedule.trace.json").write_text(json.dumps(schedule.trace.as_json(), indent=2) + "\n")
-        lowered = relax.transform.LegalizeOps()(scheduled)
         graph = export_graph(lowered, out, memory_limit_bytes=1 << 20)
         report["graph"] = graph
+        report["graph_mode"] = args.graph_mode
+        if len(graph["calls"]) != (2 if args.graph_mode == "optimized" else 3):
+            raise ValueError("fixture CPU fusion count differs from the selected graph mode")
         llvm_ir = (out / "operators.ll").read_text()
         if "@tvm_gemmini_compute(" not in llvm_ir or "@tvm_gemmini_matmul_i8_i32(" in llvm_ir:
             raise ValueError("generated operators do not use the scheduled primitive route")
         tiles_m, tiles_n, tiles_k = (m+15)//16, (n+15)//16, (k+15)//16
-        counters = {"LOADS_A": tiles_m*((tiles_n+args.tile_j-1)//args.tile_j)*tiles_k, "LOADS_B": tiles_n*((tiles_m+args.tile_i-1)//args.tile_i)*tiles_k, "COMPUTES": tiles_m*tiles_n*tiles_k, "STORES": tiles_m*tiles_n}
-        report["schedule"] = {"tile_i": args.tile_i, "tile_j": args.tile_j, "expected_calls_per_invocation": counters, "metadata": schedule.metadata,
+        counters = {"LOADS_A": tiles_m*((tiles_n+tile_j-1)//tile_j)*tiles_k, "LOADS_B": tiles_n*((tiles_m+tile_i-1)//tile_i)*tiles_k, "COMPUTES": tiles_m*tiles_n*tiles_k, "STORES": tiles_m*tiles_n}
+        report["schedule"] = {"tile_i": tile_i, "tile_j": tile_j, "expected_calls_per_invocation": counters, "metadata": schedule.metadata,
                               "lowering_steps": schedule.lowering_steps, "trace_scope": "TensorIntrin substitution from the generated tiled semantic template"}
         fixture = {"M": m, "N": n, "K": k, "WORKSPACE_BYTES": graph["workspace_bytes"], "CONSTANT_BYTES": graph["constants_bytes"], **counters}
         (out / "fixture.h").write_text("\n".join(f"#define {name} {value}" for name, value in fixture.items()) + "\n")
@@ -289,6 +313,11 @@ def main():
         wrong = command([*extension, programs["bad-oracle"]], "bad-oracle", simulator_env, expected=22)
         if "GRAPH_NUMERICAL_FAILURE" not in wrong:
             raise ValueError("wrong-oracle control did not reach its numerical gate")
+        if search is not None:
+            platform_parts = [report["plugin"]["sha256"], report["spike"]["sha256"], "rv64gc", GUEST_BASE, GUEST_BYTES]
+            platform_id = "functional_spike:" + hashlib.sha256(json.dumps(platform_parts).encode()).hexdigest()
+            search.record_device_check(proposal.candidate.candidate_id, passed=True, platform_id=platform_id, evidence=str(out / "receipt.json"))
+            report["search"] = search.manifest()
         for path, digest in immutable.items():
             if identity(path)["sha256"] != digest:
                 raise ValueError("source/tool changed during verification")
