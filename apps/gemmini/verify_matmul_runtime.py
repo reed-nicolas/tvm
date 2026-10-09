@@ -210,6 +210,69 @@ int main(void) {
 """
 
 
+def bind_runtime(paths, app, report, bind):
+    """Validate the shared pinned adapter/simulator/tool inputs before execution."""
+    adapter_path, simulator_path = paths['adapter_receipt'], paths['simulator_receipt']
+    report['adapter_receipt'], report['simulator_receipt'] = bind(adapter_path), bind(simulator_path)
+    adapter, simulator = json.loads(adapter_path.read_text()), json.loads(simulator_path.read_text())
+    if adapter['status'] != 'cross_compiled' or simulator['status'] != 'built_and_load_verified':
+        raise ValueError('Require passing adapter compilation and explicit simulator load receipts')
+    if adapter['source_set']['gemmini'] != HARDWARE_REVISION:
+        raise ValueError('Adapter hardware source differs from the inspected provisional source set')
+    if adapter['headers']['include/gemmini_params.h']['sha256'] != PARAMS_SHA256:
+        raise ValueError('Adapter parameter header differs from the canonical integer header')
+    if adapter['headers']['include/gemmini.h']['sha256'] != OPERATOR_SHA256:
+        raise ValueError('Adapter operator header differs from the pinned C-library ABI')
+    if simulator['libgemmini_revision'] != adapter['source_set']['libgemmini'] or simulator['sources']['gemmini_params.h'] != PARAMS_SHA256:
+        raise ValueError('Simulator revision/parameter header does not bind to the adapter source set')
+    if checked_path(simulator['plugin_path']) != paths['plugin'] or checked_path(simulator['spike_path']) != paths['spike']:
+        raise ValueError('Explicit plugin/Spike paths differ from simulator build receipt')
+    if simulator['load_smoke']['returncode'] != 0:
+        raise ValueError('Simulator receipt does not establish successful explicit plugin loading')
+    if set(simulator['sources']) != {'gemmini.cc', 'gemmini.h', 'gemmini_params.h', 'Makefile'}:
+        raise ValueError('Simulator receipt has an unexpected staged source set')
+    object_path = checked_path(adapter_path.parent / 'matmul.o')
+    report['adapter_object'] = bind(object_path, adapter['object_sha256'])
+    for name, digest in adapter['adapter_sources'].items():
+        bind(app / name, digest)
+    for name, binding in adapter['headers'].items():
+        bind(adapter_path.parent / 'headers' / name, binding['sha256'])
+    for name, digest in simulator['sources'].items():
+        bind(simulator_path.parent / 'source' / name, digest)
+    for path, digest in simulator['resolved_compiler_dependencies'].items():
+        bind(path, digest)
+    bind(simulator['compiler'], simulator['compiler_sha256'])
+    bind(checked_path(simulator['builder_path']), simulator['builder_sha256'])
+    report['plugin'] = bind(paths['plugin'], simulator['plugin_sha256'])
+    report['spike'] = bind(paths['spike'], simulator['spike_sha256'])
+    gcc = paths['riscv_gcc']
+    if not gcc.name.endswith('gcc'):
+        raise ValueError('Compiler filename must end in gcc to identify sibling tools')
+    report['compiler'] = bind(gcc, adapter['compiler']['sha256'])
+    tools = {name: checked_path(gcc.with_name(gcc.name[:-3] + name)) for name in ('nm', 'objdump', 'readelf')}
+    report['tool_identities'] = [bind(paths['dtc']), *[bind(tool) for tool in tools.values()]]
+    if checked_path(simulator['dtc_path']) != paths['dtc']:
+        raise ValueError('Selected dtc differs from simulator load receipt')
+    bind(paths['dtc'], simulator['dtc_sha256'])
+    bind(paths['spike_library_dir'] / 'libstdc++.so.6', simulator['runtime_libstdcpp_sha256'])
+    report['runtime_helpers'] = [bind(app / 'verify_baremetal_cpu.py'), bind(app / 'verify_matmul.py')]
+    report['verifier_source'] = bind(__file__)
+    report['adapter_sources'], report['headers'], report['source_set'] = adapter['adapter_sources'], adapter['headers'], adapter['source_set']
+    report['simulator_qualification'] = simulator.get('qualification', {})
+    report['simulator_dependency_receipt'] = {'sources': simulator['sources'], 'resolved_compiler_dependencies': simulator['resolved_compiler_dependencies']}
+    report['simulator_dependency_scope'] = simulator.get('dependency_scope', 'compiler -MMD records non-system dependencies, not every system header')
+    definitions = adapter['instruction_policy']['derived_definitions']
+    forbidden = {value for name, value in definitions.items() if name.startswith('k_LOOP_')}
+    opcode = adapter['instruction_policy']['custom_opcode']
+    if adapter['instruction_policy']['hardware_loops'] != 'forbidden' or not forbidden:
+        raise ValueError('Adapter lacks source-derived no-FSM policy')
+    object_audit = audit_instructions(object_path.read_bytes(), opcode, forbidden)
+    if object_audit['prohibited_hits']:
+        raise ValueError('Selected adapter object contains prohibited FSM instructions')
+    report['instruction_policy'] = adapter['instruction_policy']
+    return object_path, gcc, tools, opcode, forbidden
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('adapter-receipt', 'simulator-receipt', 'riscv-gcc', 'spike', 'dtc', 'spike-library-dir', 'plugin', 'output-dir'):
@@ -267,64 +330,7 @@ def main():
         return info
 
     try:
-        adapter_path, simulator_path = paths['adapter_receipt'], paths['simulator_receipt']
-        report['adapter_receipt'], report['simulator_receipt'] = bind(adapter_path), bind(simulator_path)
-        adapter, simulator = json.loads(adapter_path.read_text()), json.loads(simulator_path.read_text())
-        if adapter['status'] != 'cross_compiled' or simulator['status'] != 'built_and_load_verified':
-            raise ValueError('Require passing adapter compilation and explicit simulator load receipts')
-        if adapter['source_set']['gemmini'] != HARDWARE_REVISION:
-            raise ValueError('Adapter hardware source differs from the inspected provisional source set')
-        if adapter['headers']['include/gemmini_params.h']['sha256'] != PARAMS_SHA256:
-            raise ValueError('Adapter parameter header differs from the canonical integer header')
-        if adapter['headers']['include/gemmini.h']['sha256'] != OPERATOR_SHA256:
-            raise ValueError('Adapter operator header differs from the pinned C-library ABI')
-        if simulator['libgemmini_revision'] != adapter['source_set']['libgemmini'] or simulator['sources']['gemmini_params.h'] != PARAMS_SHA256:
-            raise ValueError('Simulator revision/parameter header does not bind to the adapter source set')
-        if checked_path(simulator['plugin_path']) != paths['plugin'] or checked_path(simulator['spike_path']) != paths['spike']:
-            raise ValueError('Explicit plugin/Spike paths differ from simulator build receipt')
-        if simulator['load_smoke']['returncode'] != 0:
-            raise ValueError('Simulator receipt does not establish successful explicit plugin loading')
-        if set(simulator['sources']) != {'gemmini.cc', 'gemmini.h', 'gemmini_params.h', 'Makefile'}:
-            raise ValueError('Simulator receipt has an unexpected staged source set')
-        object_path = checked_path(adapter_path.parent / 'matmul.o')
-        report['adapter_object'] = bind(object_path, adapter['object_sha256'])
-        for name, digest in adapter['adapter_sources'].items():
-            bind(app / name, digest)
-        for name, binding in adapter['headers'].items():
-            bind(adapter_path.parent / 'headers' / name, binding['sha256'])
-        for name, digest in simulator['sources'].items():
-            bind(simulator_path.parent / 'source' / name, digest)
-        for path, digest in simulator['resolved_compiler_dependencies'].items():
-            bind(path, digest)
-        bind(simulator['compiler'], simulator['compiler_sha256'])
-        bind(checked_path(simulator['builder_path']), simulator['builder_sha256'])
-        report['plugin'] = bind(paths['plugin'], simulator['plugin_sha256'])
-        report['spike'] = bind(paths['spike'], simulator['spike_sha256'])
-        gcc = paths['riscv_gcc']
-        if not gcc.name.endswith('gcc'):
-            raise ValueError('Compiler filename must end in gcc to identify sibling tools')
-        report['compiler'] = bind(gcc, adapter['compiler']['sha256'])
-        tools = {name: checked_path(gcc.with_name(gcc.name[:-3] + name)) for name in ('nm', 'objdump', 'readelf')}
-        report['tool_identities'] = [bind(paths['dtc']), *[bind(tool) for tool in tools.values()]]
-        if checked_path(simulator['dtc_path']) != paths['dtc']:
-            raise ValueError('Selected dtc differs from simulator load receipt')
-        bind(paths['dtc'], simulator['dtc_sha256'])
-        bind(paths['spike_library_dir'] / 'libstdc++.so.6', simulator['runtime_libstdcpp_sha256'])
-        report['runtime_helpers'] = [bind(app / 'verify_baremetal_cpu.py'), bind(app / 'verify_matmul.py')]
-        report['verifier_source'] = bind(__file__)
-        report['adapter_sources'], report['headers'], report['source_set'] = adapter['adapter_sources'], adapter['headers'], adapter['source_set']
-        report['simulator_qualification'] = simulator.get('qualification', {})
-        report['simulator_dependency_receipt'] = {'sources': simulator['sources'], 'resolved_compiler_dependencies': simulator['resolved_compiler_dependencies']}
-        report['simulator_dependency_scope'] = simulator.get('dependency_scope', 'compiler -MMD records non-system dependencies, not every system header')
-        definitions = adapter['instruction_policy']['derived_definitions']
-        forbidden = {value for name, value in definitions.items() if name.startswith('k_LOOP_')}
-        opcode = adapter['instruction_policy']['custom_opcode']
-        if adapter['instruction_policy']['hardware_loops'] != 'forbidden' or not forbidden:
-            raise ValueError('Adapter lacks source-derived no-FSM policy')
-        object_audit = audit_instructions(object_path.read_bytes(), opcode, forbidden)
-        if object_audit['prohibited_hits']:
-            raise ValueError('Selected adapter object contains prohibited FSM instructions')
-        report['instruction_policy'] = adapter['instruction_policy']
+        object_path, gcc, tools, opcode, forbidden = bind_runtime(paths, app, report, bind)
         for name, text in (('start.S', STARTUP), ('link.ld', LINKER), ('runner.c', RUNNER)):
             (out / name).write_text(text)
         compiler_env = dict(os.environ)

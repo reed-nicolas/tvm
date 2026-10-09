@@ -19,7 +19,7 @@ under the License.
 
 # Gemmini integration organization
 
-Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. An opt-in Relax pass lowers a narrow integer matmul contract to an external C call, validated with a test-only host implementation. Its Gemmini C-library adapter passes numerical checks in the pinned functional simulator. Integrated TVM graph/device execution and pretrained qualification remain pending.
+Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter and a bounded TVM-scheduled graph pass numerical checks in the pinned functional simulator. Full-model device execution, pretrained qualification and target timing remain pending.
 
 | Future location | Integration responsibility |
 | --- | --- |
@@ -104,7 +104,7 @@ Set each path to the selected build/tool installation and use a fresh output dir
 
 [baremetal.py](baremetal.py) provides the reusable `plan_graph` and `export_graph` interfaces for straight-line, static Relax `call_tir` graphs. Optimize and legalize the graph before export. It derives raw-pointer calls, a single constants blob, caller-owned outputs and an aligned workspace reused after each tensor's last use. Integer/FP32/bool tensors, multiple inputs and tuple outputs are supported; dynamic shapes, control flow and hidden scalar ABIs are rejected. Export writes the operator object, C orchestration, constant assembly/blob, IR and `graph.json` into the supplied output directory.
 
-The generated `model_run(inputs, outputs, workspace, workspace_bytes)` validates alignment, byte spans and writable-buffer overlap before dispatch. The manifest's memory limit covers explicit tensors only; ELF sections, operator stack allocations and platform reservations must be added for deployment. Four native tests verify mixed dtypes, repeated calls, tuple retention/copies, workspace reuse, fused FP32 semantics and rejection paths. This exporter has not yet qualified an integrated Gemmini graph or full model. In the activated host environment, run `python tests/python/relax/test_backend_contrib_gemmini_baremetal.py`.
+The generated `model_run(inputs, outputs, workspace, workspace_bytes)` validates alignment, byte spans and writable-buffer overlap before dispatch. The manifest's memory limit covers explicit tensors only; ELF sections, operator stack allocations and platform reservations must be added for deployment. Seven native tests verify mixed dtypes, repeated calls, tuple retention/copies, simultaneous output lifetimes, workspace reuse, fused FP32 semantics and alignment/ABI rejection. The bounded scheduled graph below uses this exporter; full-model qualification remains pending. In the activated host environment, run `python tests/python/relax/test_backend_contrib_gemmini_baremetal.py`.
 
 [verify_baremetal_cpu.py](verify_baremetal_cpu.py) compiles a fixed FP32 matmul/add/ReLU Relax graph into RISC-V CPU operations and derives static calls/constants from its legalized bindings. It links machine-mode startup, HTIF console/exit and caller-owned buffers without guest libc, libtvm, a C++ runtime or heap. Eight calls across five inputs must match an independent scalar oracle exactly, preserve input/constant/previous-output bytes and buffer canaries, and recover from a null-input rejection. A deliberately incorrect oracle must produce a failing target exit. Dynamic shapes, other dtypes, tuple outputs and unlegalized graphs are rejected.
 
@@ -123,5 +123,19 @@ python "$TVM_ROOT/apps/gemmini/verify_baremetal_cpu.py" --tvm-source "$TVM_ROOT"
 ```
 
 The output directory must be new. Spike's selected library directory must provide its compatible `libstdc++.so.6`; the verifier supplies this path and the selected `dtc` to the Spike process without sourcing global Chipyard setup. Review the recorded limits before extending this proof to additional graphs or a real platform startup/transport.
+
+## Scheduled graph in Gemmini Spike
+
+[verify_graph.py](verify_graph.py) builds a Relax graph containing a 17×33 by 33×19 integer matmul, bias and ReLU. TVM generates the Gemmini schedule and CPU operations; the static exporter supplies calls, constants and workspace. The guest checks six repeated invocations against an independent int64 oracle, primitive call counts, input/constant preservation, guards, retained outputs and recovery after rejected buffers. Missing-extension and wrong-oracle controls must fail, and both final ELFs must contain no FSM instructions.
+
+```sh
+python "$TVM_ROOT/apps/gemmini/verify_graph.py" --tvm-source "$TVM_ROOT" --tvm-build "$TVM_BUILD" \
+  --adapter-receipt "$ADAPTER_BUILD/receipt.json" --simulator-receipt "$SIMULATOR_BUILD/receipt.json" \
+  --riscv-gcc "$RISCV_BIN/riscv64-unknown-elf-gcc" --spike "$RISCV_BIN/spike" --dtc "$SPIKE_SUPPORT/bin/dtc" \
+  --spike-library-dir "$SPIKE_SUPPORT/lib" --plugin "$SIMULATOR_BUILD/libgemmini.so" \
+  --tile-i 2 --tile-j 2 --output-dir "$BUILD_ROOT/scheduled-graph-check"
+```
+
+Use matching adapter/simulator receipts and a fresh output directory. Both 1×1 and 2×2 schedules pass: A/B loads each fall from twelve to six, while computation and outputs are unchanged. The receipt retains semantic/tensorized IR, a replayable substitution trace, tool/source identities, final ELF bounds and a painted-stack high-water observation. The requested generic Spike map is 256 MiB; this does not establish deployed capacity. No full-model, timing or actual-platform coherence qualification is implied.
 
 The model order is canonical ResNet50, TinyLlama 1B, then SmolVLA. Prove small matmul and convolution cases using the selected target's arithmetic before full-model device execution. The proposed signed-int8/int32 contract requires matching hardware and generated headers; it does not apply to a floating-point configuration. Keep model inputs and quality thresholds fixed through performance tuning; functional simulator evidence and qualified timing evidence serve distinct roles. Final comparison timing comes from FireSim, with platform and capture details coordinated by the comparison team. Keep full-model inputs, comparisons and measurement orchestration in the parent comparison repository. Build products, environments, model weights, captures and outputs stay outside this source tree, using the parent's configured `out/build/baselines/tvm-gemmini/` and other `out/` roots.
