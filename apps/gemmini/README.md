@@ -19,7 +19,7 @@ under the License.
 
 # Gemmini integration organization
 
-Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter and a bounded TVM-scheduled graph pass numerical checks in the pinned functional simulator. Full-model device execution, pretrained qualification and target timing remain pending.
+Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter, bounded TVM-scheduled graphs and a complete random integer ResNet graph pass numerical checks in the pinned functional simulator. Pretrained quality, deployed hardware and target timing remain pending.
 
 | Location | Integration responsibility |
 | --- | --- |
@@ -167,6 +167,24 @@ Add `--graph-mode optimized` to fold constants and fuse CPU operations around Ge
 
 Add `--workload conv-residual --conv-kernel 3` to the same command for a convolution/residual block; kernels 1 and 7 are also supported. The fixed N1/C17/H7/W9/O17 fixture uses same padding, channel bias, a derived residual, floor division by 512 and clipping to [0,127] before int8 output. A second int32 output exposes the raw convolution for exact checking. The independent guest oracle traverses original OIHW kernel coordinates, and each invocation poisons workspace and checks both outputs' guards and retention. This explicit integer diagnostic does not select ResNet quantization or quality policy.
 
-Kernels 1/3/7 pass optimized execution, and kernel 3 passes both graph modes plus an untrained search proposal. The 3×3 block shrinks from 12 calls/22,528 workspace bytes to 4 calls/13,952 bytes. Receipts retain tensor preflight, final ELF/stack accounting, primitive counts and no-FSM/intentional-failure gates. Full ResNet execution, deployment capacity/coherence and performance remain unqualified.
+Kernels 1/3/7 pass optimized execution, and kernel 3 passes both graph modes plus an untrained search proposal. The 3×3 block shrinks from 12 calls/22,528 workspace bytes to 4 calls/13,952 bytes. Receipts retain tensor preflight, final ELF/stack accounting, primitive counts and no-FSM/intentional-failure gates. Pretrained ResNet quality, deployment capacity/coherence and performance remain unqualified; the complete random-model functional check is described below.
+
+## Complete exported graphs in Gemmini Spike
+
+[verify_exported_graph.py](verify_exported_graph.py) consumes a complete static export and independently prepared numerical fixtures. It reuses the adapter/runtime bindings and final-ELF instruction audit; it never loads a model or generates expected answers. Its NPZ requires exactly `input_N`/`output_N` arrays with a common positive sample dimension followed by each manifest tensor's exact shape/dtype. The provenance JSON binds `fixture_sha256`, ordered unique `sample_ids`, a nonempty `reference_contract` and `reference_sources` file identities (`path`/`sha256`). These declarations identify evidence; they do not authenticate the caller's numerical oracle.
+
+```sh
+python "$TVM_ROOT/apps/gemmini/verify_exported_graph.py" --graph-dir /absolute/path/to/export \
+  --fixture /absolute/path/to/reference.npz --fixture-provenance /absolute/path/to/reference.json \
+  --tvm-source "$TVM_ROOT" --tvm-build "$TVM_BUILD" \
+  --adapter-receipt "$ADAPTER_BUILD/receipt.json" --simulator-receipt "$SIMULATOR_BUILD/receipt.json" \
+  --riscv-gcc "$RISCV_BIN/riscv64-unknown-elf-gcc" --spike "$RISCV_BIN/spike" --dtc "$SPIKE_SUPPORT/bin/dtc" \
+  --spike-library-dir "$SPIKE_SUPPORT/lib" --plugin "$SIMULATOR_BUILD/libgemmini.so" \
+  --repeats 2 --timeout 7200 --output-dir "$BUILD_ROOT/exported-graph-new-run"
+```
+
+The verifier checks every sample on each repeat against frozen little-endian output bytes. It validates typed manifest extents, binds generated fixture blobs, checks their linked ELF symbols, poisons workspace/output padding, retains previous outputs, preserves inputs/constants and counts primitive calls from the selected TIR schedules. Missing-extension and deliberately wrong-oracle controls must fail. Five direct fixture-admission tests and a bounded mixed-output simulator check pass.
+
+A complete optimized random-weight ResNet50 v1.5 graph passes two distinct 224×224 images, each repeated twice, with all controls. It uses 34,679,680 bytes of explicit tensors; the linked diagnostic image reserves 35,065,808 bytes and observes 720 stack bytes within a reserved 16 KiB. The full receipt precedes the final fixture-symbol admission refinement, which is covered by the bounded rerun. This is functional evidence in a requested generic 256-MiB Spike map; trained quality, RTL/platform coherence and deployed capacity remain unqualified. Simulator wall time supplies neither device timing nor learned-search labels.
 
 The model order is canonical ResNet50, TinyLlama 1B, then SmolVLA. Prove small matmul and convolution cases using the selected target's arithmetic before full-model device execution. The proposed signed-int8/int32 contract requires matching hardware and generated headers; it does not apply to a floating-point configuration. Keep model inputs and quality thresholds fixed through performance tuning; functional simulator evidence and qualified timing evidence serve distinct roles. Final comparison timing comes from FireSim, with platform and capture details coordinated by the comparison team. Keep full-model inputs, comparisons and measurement orchestration in the parent comparison repository. Build products, environments, model weights, captures and outputs stay outside this source tree, using the parent's configured `out/build/baselines/tvm-gemmini/` and other `out/` roots.
