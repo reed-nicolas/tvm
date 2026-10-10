@@ -800,17 +800,48 @@ class Cast(OnnxOpConverter):
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
         to_type = get_type(attr["to"])
-        if isinstance(inputs[0], relax.ShapeExpr):
-            shape = inputs[0]
+        return cls.cast(inputs[0], to_type)
+
+    @classmethod
+    def cast(cls, value, to_type):
+        if isinstance(value, relax.ShapeExpr):
+            shape = value
             if all([isinstance(x, tir.IntImm) for x in shape]):
                 shape = [int(x) for x in shape]
                 return relax.const(shape, to_type)
-        if isinstance(inputs[0], relax.Constant):
-            output = constant_numpy(inputs[0]).astype(to_type)
+        if isinstance(value, relax.Constant):
+            output = constant_numpy(value).astype(to_type)
             return relax.const(output, to_type)
+        if isinstance(value, relax.PrimValue):
+            return relax.PrimValue(value.value.astype(to_type))
+        return relax.op.astype(value, to_type)
+
+
+class CastLike(OnnxOpConverter):
+    """Cast to the target tensor's declared dtype without reading its values."""
+
+    @classmethod
+    def _impl_v15(cls, bb, inputs, attr, params):
+        if set(attr) - {"saturate", "tvm_custom"} or attr.get("saturate", 1) not in (0, 1):
+            raise ValueError("CastLike attributes are not supported")
+        info = inputs[1].struct_info
+        if isinstance(info, relax.ShapeStructInfo):
+            dtype = "int64"
+        elif isinstance(info, (relax.TensorStructInfo, relax.PrimStructInfo)):
+            dtype = info.dtype
+        else:
+            dtype = None
+        supported = {"bool", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float16", "float32", "float64", "bfloat16"}
+        if dtype not in supported:
+            raise ValueError("CastLike requires a supported, known target dtype")
         if isinstance(inputs[0], relax.PrimValue):
-            return relax.PrimValue(inputs[0].value.astype(to_type))
-        return relax.op.astype(inputs[0], to_type)
+            value = inputs[0].value
+            if not isinstance(value, (tir.IntImm, tir.FloatImm)):
+                raise ValueError("CastLike symbolic primitive inputs are not supported")
+            # ONNX CastLike returns a tensor, including when shape folding has
+            # represented its scalar input as a PrimValue.
+            return relax.const(value.value, dtype)
+        return Cast.cast(inputs[0], dtype)
 
 
 class Gather(OnnxOpConverter):
@@ -1532,8 +1563,13 @@ class Constant(OnnxOpConverter):
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
-        if "value" not in attr:
-            raise ValueError("no value in Constant")
+        numeric = {"value_int": "int64", "value_ints": "int64", "value_float": "float32", "value_floats": "float32"}
+        payloads = set(attr) - {"tvm_custom"}
+        if len(payloads) != 1 or not payloads <= {"value", *numeric}:
+            raise ValueError("Constant requires exactly one supported value attribute")
+        key = next(iter(payloads))
+        if key in numeric:
+            return relax.const(_np.asarray(attr[key], dtype=numeric[key]), numeric[key])
         value = attr.pop("value")
         # Constants may rarely have string types. These are likely exported
         # from other frameworks and not actually used in TVM. We'll just use
@@ -3443,6 +3479,7 @@ def _get_convert_map():
         "Max": Max,
         "Mean": Mean,
         "Cast": Cast,
+        "CastLike": CastLike,
         "Gemm": Gemm,
         "MatMul": MatMul,
         # "MatMulInteger": MatMulInteger,
@@ -3753,6 +3790,7 @@ class ONNXGraphImporter:
                 "Equal",
                 "Where",
                 "Cast",
+                "CastLike",
                 "Squeeze",
             ]
             return_tuple_ops = [

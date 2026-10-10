@@ -33,7 +33,7 @@ BFLOAT_CASES = ("bfloat16_matmul", "bfloat16_gemm", "bfloat16_conv2d",
                "bfloat16_sigmoid")
 CASES = ("matmul", "batched_matmul", "conv2d", "layer_norm", "rms_norm")
 IMPORTER_CASES = ("shape_add", "gather_negative", "gather_negative_constant", "expand_leading_dims", "constant_of_shape_scalar",
-                  "bfloat16_initializer", "bfloat16_constant", "bfloat16_cast")
+                  "bfloat16_initializer", "bfloat16_constant", "bfloat16_cast", "bfloat16_cast_like", "bfloat16_constant_cast_like", "cast_like_integer", "constant_integer_literals", "constant_float_literals", "cast_like_shape_scalar")
 RTOL, ATOL = 1e-4, 1e-5
 
 
@@ -195,7 +195,7 @@ def make_importer_case(name, opset, onnx, np):
                      helper.make_node("Cast", ["weight"], ["weight_float"], to=tensor.FLOAT),
                      helper.make_node("Add", ["input_float", "weight_float"], ["output"])]
             expected = inputs["value"].astype("float32") + bits.view(ml_dtypes.bfloat16).astype("float32")
-        elif name == "bfloat16_constant":
+        elif name in ("bfloat16_constant", "bfloat16_constant_cast_like"):
             first = np.array([0x3f81, 0xbeff, 0x4081], dtype="uint16")
             second = np.array([0x8000, 0x0001, 0xc181], dtype="uint16")
             # ONNX 1.17's reference Concat loses its custom BF16 dtype;
@@ -206,6 +206,8 @@ def make_importer_case(name, opset, onnx, np):
                      helper.make_node("Cast", ["weight"], ["weight_float"], to=tensor.FLOAT),
                      helper.make_node("Add", ["value", "weight_float"], ["output"])]
             expected = value + np.stack((first, second)).view(ml_dtypes.bfloat16).astype("float32")
+            if name == "bfloat16_constant_cast_like":
+                nodes[2] = helper.make_node("CastLike", ["weight", "value"], ["weight_float"])
         else:
             # Values lose nonzero low bits at the BF16 Cast. ONNX 1.17's
             # reference truncates BF16 casts; these below-halfway values agree
@@ -214,6 +216,29 @@ def make_importer_case(name, opset, onnx, np):
             nodes = [helper.make_node("Cast", ["value"], ["rounded"], to=tensor.BFLOAT16),
                      helper.make_node("Cast", ["rounded"], ["output"], to=tensor.FLOAT)]
             expected = inputs["value"].astype(ml_dtypes.bfloat16).astype("float32")
+            if name == "bfloat16_cast_like":
+                # Target shape and values do not participate in the conversion.
+                inputs["target"] = np.array([123], dtype=ml_dtypes.bfloat16)
+                nodes = [helper.make_node("CastLike", ["value", "target"], ["rounded"]), helper.make_node("CastLike", ["rounded", "value"], ["output"])]
+    elif name == "cast_like_integer":
+        inputs["value"] = np.array([[-2.9, -1.1, 0.1], [1.9, 2.1, 3.9]], dtype="float32")
+        inputs["target"] = np.array([2**40 + 7], dtype="int64")
+        nodes = [helper.make_node("CastLike", ["value", "target"], ["output"])]
+        expected = inputs["value"].astype("int64")
+    elif name in ("constant_integer_literals", "constant_float_literals"):
+        inputs = {}
+        integer = name == "constant_integer_literals"
+        scalar = 2**40 + 7 if integer else -1.25
+        vector = [-3, 0, 17] if integer else [0.1, 2.5, -3.75]
+        scalar_attribute = {"value_int" if integer else "value_float": scalar}
+        vector_attribute = {"value_ints" if integer else "value_floats": vector}
+        nodes = [helper.make_node("Constant", [], ["scalar"], **scalar_attribute), helper.make_node("Constant", [], ["vector"], **vector_attribute), helper.make_node("Add", ["scalar", "vector"], ["output"])]
+        dtype = "int64" if integer else "float32"
+        expected = np.array(scalar, dtype=dtype) + np.array(vector, dtype=dtype)
+    elif name == "cast_like_shape_scalar":
+        initializers = [numpy_helper.from_array(np.array(-1, dtype="int64"), "index")]
+        nodes = [helper.make_node("Shape", ["value"], ["shape"]), helper.make_node("Gather", ["shape", "index"], ["width"], axis=0), helper.make_node("CastLike", ["width", "value"], ["floating_width"]), helper.make_node("Sqrt", ["floating_width"], ["output"])]
+        expected = np.sqrt(np.array(value.shape[-1], dtype="float32"))
     elif name == "shape_add":
         offset = np.array([1, 3, 2**40 + 7], dtype="int64")
         initializers = [numpy_helper.from_array(np.array(0, dtype="int64"), "index"), numpy_helper.from_array(offset, "offset")]
@@ -331,6 +356,12 @@ def run_case(name, opset, output, from_onnx, torch, onnx, np, tvm):
         record["operators"] = dict(sorted(Counter(f"{node.domain or 'ai.onnx'}::{node.op_type}" for node in graph.graph.node).items()))
         record["stage"] = "onnx_reference"
         onnx.checker.check_model(graph, full_check=True)
+        reference_supported = True
+        if name == "bfloat16_cast_like":
+            try:
+                onnx.helper.np_dtype_to_tensor_dtype(inputs["target"].dtype)
+            except ValueError:
+                reference_supported = False
         if name in BFLOAT_CASES:
             # ONNX 1.17's reference kernels operate on the uint16/FP32
             # containers, not source BF16 contraction/normalization arithmetic.
@@ -338,6 +369,8 @@ def run_case(name, opset, output, from_onnx, torch, onnx, np, tvm):
             record["onnx_reference"] = {"executed": False, "reason": "ONNX BF16 reference arithmetic is unsupported; independent PyTorch CPU reference used"}
             record["arithmetic_contract"] = {"operand_dtype": "bfloat16", "accumulator_or_statistics_dtype": "float32",
                                              "result_dtype": "bfloat16", "weight_precision_changed": False}
+        elif not reference_supported:
+            record["onnx_reference"] = {"executed": False, "reason": "Selected ONNX dependency cannot map ml_dtypes BF16 for CastLike; independent NumPy rounding reference used"}
         else:
             reference = ReferenceEvaluator(graph).run(None, inputs)[0]
             record["onnx_output"] = tensors([reference])[0]
@@ -377,7 +410,7 @@ def run_case(name, opset, output, from_onnx, torch, onnx, np, tvm):
         record["stage"] = "numerical_compare"
         record[f"relax_vs_{reference_name}"] = compare(actual, expected, np)
         comparisons = [f"relax_vs_{reference_name}"]
-        if name not in BFLOAT_CASES:
+        if "onnx_output" in record:
             record["relax_vs_onnx"] = compare(actual, reference, np)
             comparisons.append("relax_vs_onnx")
         if not all(record[key]["passed"] for key in comparisons):
