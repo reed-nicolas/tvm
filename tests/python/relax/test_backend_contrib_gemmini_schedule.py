@@ -26,7 +26,7 @@ import unittest
 import numpy as np
 import tvm
 from tvm import relax, tir
-from tvm.relax.backend.contrib.gemmini import LowerGemminiMatmul, LowerGemminiScheduledMatmul, prepare_gemmini_graph
+from tvm.relax.backend.contrib.gemmini import DecomposeGemminiLinear, LowerGemminiMatmul, LowerGemminiScheduledMatmul, prepare_gemmini_graph
 from tvm.relax.backend.contrib.gemmini_schedule import make_gemmini_matmul, make_semantic_matmul, tensorize_gemmini_matmul
 
 # This emulator interprets row-addressed primitive calls independently of TVM
@@ -351,6 +351,71 @@ class GemminiScheduleTests(unittest.TestCase):
         self.assertEqual(len(reference_primitives), 1)
         self.assertIn("tvm_gemmini_matmul_i8_i32", reference_primitives[0].script())
         self.assertNotIn("tvm_gemmini_compute", reference_primitives[0].script())
+
+    def test_linear_vectors_and_batches_preserve_shapes_and_exact_primitives(self):
+        for shape in ((33,), (2, 17, 33), (2, 1, 17, 33)):
+            a = ((np.arange(np.prod(shape)).reshape(shape) * 11 % 256) - 128).astype("int8")
+            b = ((np.arange(33 * 19).reshape(33, 19) * 7 % 256) - 128).astype("int8")
+            lhs = relax.Var("a", relax.TensorStructInfo(shape, "int8"))
+            builder = relax.BlockBuilder()
+            with builder.function("main", [lhs]):
+                builder.emit_func_output(relax.op.matmul(lhs, relax.const(b), out_dtype="int32"))
+            original = builder.get()
+            for optimize in (False, True):
+                with self.subTest(shape=shape, optimize=optimize):
+                    lowered = prepare_gemmini_graph(original, 2, 2, optimize=optimize)
+                    self.assertTrue(relax.analysis.well_formed(lowered))
+                    vm, control = self.build_graph(lowered)
+                    device_a = tvm.nd.array(a)
+                    first = vm["main"](device_a)
+                    expected = a.astype("int64") @ b.astype("int64")
+                    self.assertEqual(first.dtype, "int32")
+                    np.testing.assert_array_equal(first.numpy(), expected)
+                    saved = first.numpy()
+                    np.testing.assert_array_equal(vm["main"](tvm.nd.array(np.zeros_like(a))).numpy(), np.zeros_like(expected))
+                    np.testing.assert_array_equal(first.numpy(), saved)
+                    np.testing.assert_array_equal(device_a.numpy(), a)
+                    self.assertEqual(control.emulator_faults(), 0)
+                    self.assertEqual(control.emulator_count(0), 2)
+
+    def test_linear_admission_preserves_unsupported_calls(self):
+        for left, right, dtype, output in (((2, 3, 33), (2, 33, 19), "int8", "int32"), ((2, 3, 33), (33, 19), "float32", "float32"), ((2, 3, 131072), (131072, 19), "int8", "int32"), ((2, 0, 33), (33, 19), "int8", "int32")):
+            a = relax.Var("a", relax.TensorStructInfo(left, dtype))
+            b = relax.Var("b", relax.TensorStructInfo(right, dtype))
+            builder = relax.BlockBuilder()
+            with builder.function("main", [a, b]):
+                builder.emit_func_output(relax.op.matmul(a, b, out_dtype=output))
+            mod = builder.get()
+            tvm.ir.assert_structural_equal(DecomposeGemminiLinear()(mod), mod)
+
+    def test_onnx_integer_matmul_signed_zero_points_and_refusals(self):
+        import onnx
+        from tvm.relax.frontend.onnx import from_onnx
+        for zero_points in (None, (0, 0), (1, 0)):
+            for dtype in ("int8", "uint8"):
+                shape, k, n = (2, 3, 17), 17, 19
+                a = ((np.arange(np.prod(shape)).reshape(shape) * 11 % 256) - 128).astype(dtype)
+                b = ((np.arange(k * n).reshape(k, n) * 7 % 256) - 128).astype(dtype)
+                kind = onnx.TensorProto.INT8 if dtype == "int8" else onnx.TensorProto.UINT8
+                initializers = [onnx.numpy_helper.from_array(b, "b")]
+                names = ["a", "b"]
+                if zero_points is not None:
+                    for name, value in zip(("az", "bz"), zero_points):
+                        initializers.append(onnx.numpy_helper.from_array(np.array(value, dtype=dtype), name))
+                        names.append(name)
+                node = onnx.helper.make_node("MatMulInteger", names, ["out"])
+                graph = onnx.helper.make_graph([node], "linear", [onnx.helper.make_tensor_value_info("a", kind, shape)], [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.INT32, (2, 3, n))], initializers)
+                model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
+                onnx.checker.check_model(model, full_check=True)
+                if dtype == "uint8" or zero_points == (1, 0):
+                    with self.assertRaises(NotImplementedError):
+                        from_onnx(model, keep_params_in_input=False)
+                    continue
+                mod = from_onnx(model, keep_params_in_input=False)
+                vm, control = self.build_graph(prepare_gemmini_graph(mod, 2, 2))
+                np.testing.assert_array_equal(vm["main"](tvm.nd.array(a)).numpy(), a.astype("int64") @ b.astype("int64"))
+                self.assertEqual(control.emulator_faults(), 0)
+                self.assertEqual(control.emulator_count(0), 1)
 
     def test_graph_pipeline_frozen_weight_cpu_fusion_and_tuple_semantics(self):
         original, weight, bias = quantized_graph()

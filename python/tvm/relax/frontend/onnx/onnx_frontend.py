@@ -355,6 +355,25 @@ class MatMul(OnnxOpConverter):
         return relax.op.matmul(inputs[0], inputs[1])
 
 
+class MatMulInteger(OnnxOpConverter):
+    """Preserve symmetric signed INT8 operands and INT32 accumulation."""
+
+    @classmethod
+    def _impl_v10(cls, bb, inputs, attr, params):
+        if any(value.struct_info.dtype != "int8" for value in inputs[:2]):
+            raise NotImplementedError("MatMulInteger currently requires signed INT8 operands")
+        for index in (2, 3):
+            if len(inputs) <= index or inputs[index] is None:
+                continue
+            point = get_constant(inputs[index], params)
+            if not isinstance(point, relax.Constant) or point.struct_info.dtype != "int8":
+                raise NotImplementedError("MatMulInteger requires constant signed zero points")
+            value = point.data.numpy()
+            if value.size != 1 or value.item() != 0:
+                raise NotImplementedError("MatMulInteger currently supports scalar zero points equal to zero")
+        return relax.op.matmul(inputs[0], inputs[1], out_dtype="int32")
+
+
 def _to_numpy(x):
     if isinstance(x, relax.PrimValue):
         x = x.value
@@ -3482,7 +3501,7 @@ def _get_convert_map():
         "CastLike": CastLike,
         "Gemm": Gemm,
         "MatMul": MatMul,
-        # "MatMulInteger": MatMulInteger,
+        "MatMulInteger": MatMulInteger,
         # "MatMulInteger16": MatMulInteger16,
         "Reshape": Reshape,
         "Sigmoid": Sigmoid,

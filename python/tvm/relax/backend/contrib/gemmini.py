@@ -22,6 +22,8 @@ link an implementation of apps/gemmini/matmul.h when exporting the executable.
 Run before LegalizeOps. Unsupported calls remain ordinary Relax operations.
 """
 
+from math import prod
+
 import tvm
 from tvm import relax, tir
 from tvm.relax.expr_functor import PyExprMutator, mutator
@@ -31,8 +33,8 @@ _MAX_K = ((1 << 31) - 1) // (128 * 128)
 _MAX_BYTES = (1 << 63) - 1
 
 
-def _shape(info, dtype):
-    if not isinstance(info, relax.TensorStructInfo) or info.dtype != dtype or info.ndim != 2:
+def _shape(info, dtype, ndim=2):
+    if not isinstance(info, relax.TensorStructInfo) or info.dtype != dtype or info.ndim != ndim:
         return None
     if not isinstance(info.shape, relax.ShapeExpr):
         return None
@@ -41,6 +43,53 @@ def _shape(info, dtype):
     if any(not isinstance(dim, tir.IntImm) or dim.value <= 0 for dim in info.shape):
         return None
     return tuple(int(dim.value) for dim in info.shape)
+
+
+@mutator
+class _LinearLowerer(PyExprMutator):
+    def visit_call_(self, call):
+        call = self.visit_expr_post_order(call)
+        if not isinstance(call.op, tvm.ir.Op) or call.op.name != "relax.matmul":
+            return call
+        rank = call.args[0].struct_info.ndim
+        if rank < 1 or rank == 2:
+            return call
+        left = _shape(call.args[0].struct_info, "int8", rank)
+        right = _shape(call.args[1].struct_info, "int8")
+        output = _shape(call.struct_info, "int32", rank)
+        if left is None or right is None or output is None:
+            return call
+        k, n = right
+        m = prod(left[:-1])
+        if left[-1] != k or output != left[:-1] + (n,) or k > _MAX_K or n * 4 > (1 << 32) - 1:
+            return call
+        if max(m * k, k * n, m * n * 4) > _MAX_BYTES:
+            return call
+        flattened = self.builder_.emit(relax.op.reshape(call.args[0], (m, k)))
+        product = self.builder_.emit(relax.op.matmul(flattened, call.args[1], out_dtype="int32"))
+        return self.builder_.normalize(relax.op.reshape(product, output))
+
+    def visit_function_(self, func):
+        if func.attrs and ("Codegen" in func.attrs or "Composite" in func.attrs):
+            return func
+        return super().visit_function_(func)
+
+
+@tvm.transform.module_pass(opt_level=0, name="DecomposeGemminiLinear")
+class DecomposeGemminiLinear:
+    """Flatten static INT8 vectors/batches multiplying a shared 2D weight.
+
+    Reshapes preserve the INT32 contraction and original output shape. Quantization,
+    bias and dequantization remain explicit graph operations. Batched weights,
+    dynamic/empty shapes, non-CPU tensors and unsupported arithmetic stay unchanged.
+    """
+
+    def transform_module(self, mod, _ctx):
+        lowerer = _LinearLowerer(mod)
+        for gv, func in list(mod.functions_items()):
+            if isinstance(func, relax.Function):
+                lowerer.builder_.update_func(gv, lowerer.visit_expr(func))
+        return lowerer.builder_.get()
 
 
 def _eligible(call):
@@ -189,7 +238,7 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True):
             raise ValueError("Optimized Gemmini preparation requires a semantic graph before device lowering")
     from .gemmini_conv import DecomposeGemminiConv2D  # pylint: disable=import-outside-toplevel
 
-    mod = DecomposeGemminiConv2D()(mod)
+    mod = DecomposeGemminiLinear()(DecomposeGemminiConv2D()(mod))
     if optimize:
         mod = tvm.transform.Sequential([relax.transform.FoldConstant(), relax.transform.CanonicalizeBindings()])(mod)
     mod = relax.transform.LegalizeOps()(lower(mod))

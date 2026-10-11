@@ -51,6 +51,16 @@ The selected backend route calls the Gemmini C operator library, following the c
 
 Agustin permits baremetal or RTOS; this integration chooses baremetal. Host export/reload alone proves neither RISC-V nor baremetal deployment. The independent CPU probe establishes a bounded static generated-graph route under generic Spike, not general Relax runtime support. Confirm actual deployment ISA/ABI, startup and addressability; hardware revision, generated headers, quantization and timing boundaries remain explicit inputs. MX Gemmini requires a different hardware and numerical contract. Expose CPU work, data conversion, transfer and completion costs to the comparison harness.
 
+## Integer learned-weight projections
+
+`prepare_gemmini_graph` flattens static vector or batched signed-INT8 activations multiplying a shared rank-two signed-INT8 weight, schedules the resulting INT32 matmul, and restores the original output shape. The existing reduction, resource and byte bounds apply. Quantization, bias and dequantization stay explicit; batched weights and unsupported arithmetic stay on the host. The ONNX frontend preserves `MatMulInteger` signed operands with absent or scalar constant zero points equal to zero; unsigned operands, nonzero points and per-axis points are currently refused. This supports projection integration, not complete transformer device or quality qualification.
+
+The existing schedule suite covers vector/batched shapes, both graph modes, repeated calls, retained outputs, immutable inputs, independent INT64 references and primitive bounds. It also checks ONNX import and unsupported-case refusal. Run its focused entry point using the selected host environment:
+
+```sh
+python "$TVM_ROOT/tests/python/relax/test_backend_contrib_gemmini_schedule.py"
+```
+
 ## External matmul compiler boundary
 
 Apply `tvm.relax.backend.contrib.gemmini.LowerGemminiMatmul()` before `LegalizeOps` and build for a CPU target. The pass admits positive, static, rank-two signed-int8 `[M,K] @ [K,N]` matmul with signed-int32 `[M,N]` output and `K <= 131071`. That bound makes every product and partial sum representable for all signed-int8 inputs. Dynamic shapes, batches, other dtypes and explicitly non-CPU tensor placement remain ordinary Relax operations. Existing `Codegen`/`Composite` functions are preserved. No quantization, bias, activation, scale or transpose fusion is implied, and a float ResNet graph receives no acceleration from this pass.
