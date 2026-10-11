@@ -285,21 +285,17 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
     Emitted TVM runtime workspace allocation/free dependencies are rejected;
     this static exporter provides no guest allocator or callback initialization.
     """
-    plan = plan_graph(mod)
+    return _export_plan(mod, plan_graph(mod), output_dir, target, memory_limit_bytes)
+
+
+def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix="", shared_constants=None):
     preflight = _memory_preflight(plan, memory_limit_bytes)
     tensors_bytes = preflight["allocated"]["explicit_tensor_bytes"]
     output_dir = checked_path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    constant_path = output_dir / "constants.bin"
-    with constant_path.open("wb") as stream:
-        for tensor in plan["constants"]:
-            stream.seek(tensor.offset)
-            stream.write(tensor.value.astype(np.dtype(tensor.dtype).newbyteorder("<"), copy=False).tobytes())
-        stream.truncate(max(plan["constants_bytes"], 1))
-    include_path = str(constant_path.absolute()).replace("\\", "\\\\").replace('"', '\\"')
-    if any(character in include_path for character in ("\n", "\r")):
-        raise ValueError("constant artifact path contains an unsupported line break")
-    (output_dir / "constants.S").write_text(f'.section .rodata.model_constants,"a",@progbits\n.balign {ALIGNMENT}\n.globl model_constants\nmodel_constants:\n.incbin "{include_path}"\n.section .note.GNU-stack,"",@progbits\n')
+    constant_path = output_dir / "constants.bin" if shared_constants is None else shared_constants
+    if shared_constants is None:
+        _write_constants(plan["constants"], plan["constants_bytes"], constant_path)
 
     def address(tensor):
         if tensor.origin == "input":
@@ -310,7 +306,12 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
             return f"(model_constants + {tensor.offset})"
         return f"(workspace + {tensor.offset})"
 
-    lines = ["#include <stdint.h>", "#include <stddef.h>", "extern const uint8_t model_constants[];", "static const char *model_last_error;", "void TVMAPISetLastError(const char *message) { model_last_error = message; }", "const char *model_get_last_error(void) { return model_last_error; }"]
+    lines = ["#include <stdint.h>", "#include <stddef.h>", "extern const uint8_t model_constants[];"]
+    if shared_constants is None:
+        lines.extend(["static const char *model_last_error;", "void TVMAPISetLastError(const char *message) { model_last_error = message; }"])
+    else:
+        lines.append("extern const char *model_last_error;")
+    lines.append(f"const char *{prefix}model_get_last_error(void) {{ return model_last_error; }}")
     for symbol, args, results in plan["calls"]:
         ctypes = [DTYPES[tensor.dtype] + "*" for tensor in [*args, *results]]
         declaration = "extern int32_t " + symbol + "(" + ", ".join(ctypes) + ");"
@@ -319,7 +320,7 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
     lines.extend([
         "static int model_span(const void *pointer, uint64_t bytes) { return pointer && !((uintptr_t)pointer % 64) && bytes <= UINTPTR_MAX - (uintptr_t)pointer; }",
         "static int model_overlap(const void *a, uint64_t an, const void *b, uint64_t bn) { return an && bn && (uintptr_t)a < (uintptr_t)b + bn && (uintptr_t)b < (uintptr_t)a + an; }",
-        "int32_t model_run(const void *const *inputs, void *const *outputs, uint8_t *workspace, uint64_t workspace_bytes) {",
+        f"int32_t {prefix}model_run(const void *const *inputs, void *const *outputs, uint8_t *workspace, uint64_t workspace_bytes) {{",
         "  model_last_error = 0;",
         "  if (!inputs || !outputs) return -1;",
         f"  if (workspace_bytes < UINT64_C({plan['workspace_bytes']})) return -1;",
@@ -359,6 +360,7 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
     (output_dir / "operators.tir.py").write_text(primitive_mod.script(show_meta=True))
     (output_dir / "graph.relax.py").write_text(mod.script(show_meta=True))
     manifest = {
+        "entrypoint": prefix + "model_run", "constants_file": str(constant_path),
         "target": str(target), "alignment_bytes": ALIGNMENT, "heap_required_by_orchestration": False, "runtime_workspace_allocator_required": False,
         "workspace_bytes": plan["workspace_bytes"], "constants_bytes": plan["constants_bytes"], "explicit_tensor_bytes": tensors_bytes,
         "memory_limit_bytes": memory_limit_bytes, "memory_scope": "tensor storage only; add ELF sections, operator stack/workspace, startup and platform reservations",
@@ -366,7 +368,84 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
         "inputs": [tensor.metadata() for tensor in plan["inputs"]], "outputs": [tensor.metadata() for tensor in plan["outputs"]],
         "constants": [tensor.metadata() for tensor in plan["constants"]], "intermediates": [tensor.metadata() for tensor in plan["tensors"]],
         "calls": [{"symbol": name, "inputs": [t.name for t in args], "outputs": [t.name for t in results]} for name, args, results in plan["calls"]],
-        "constants_sha256": hashlib.sha256(constant_path.read_bytes()).hexdigest(), "full_model_qualified": False, "timing_qualified": False,
+        "constants_sha256": _file_sha256(constant_path), "full_model_qualified": False, "timing_qualified": False,
     }
     (output_dir / "graph.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_constants(constants, size, path):
+    with path.open("wb") as stream:
+        for tensor in constants:
+            stream.seek(tensor.offset)
+            stream.write(tensor.value.astype(np.dtype(tensor.dtype).newbyteorder("<"), copy=False).tobytes())
+        stream.truncate(max(size, 1))
+    include_path = str(path.absolute()).replace("\\", "\\\\").replace('"', '\\"')
+    if any(character in include_path for character in ("\n", "\r")):
+        raise ValueError("constant artifact path contains an unsupported line break")
+    path.with_suffix(".S").write_text(f'.section .rodata.model_constants,"a",@progbits\n.balign {ALIGNMENT}\n.globl model_constants\nmodel_constants:\n.incbin "{include_path}"\n.section .note.GNU-stack,"",@progbits\n')
+
+
+def export_graphs(modules, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 << 30):
+    """Export static stages with distinct symbols and one deduplicated constant pool.
+
+    Stages execute serially and may reuse workspace. The reported bound covers a
+    single invocation; retained session state, executable/stack and fixtures are
+    additional. The caller still owns state routing and disjoint stage buffers.
+    """
+    if not isinstance(modules, dict) or not modules or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in modules):
+        raise ValueError("Stage names must be distinct C identifiers in a nonempty mapping")
+    output_dir = checked_path(output_dir)
+    destinations = {name: checked_path(output_dir / name) for name in modules}
+    stages, pool, unique, size, duplicated = [], [], {}, 0, 0
+    for index, (name, mod) in enumerate(modules.items()):
+        renamed = mod.replace_global_vars({gv: f"stage_{index}_operator_" + gv.name_hint for gv in mod.get_global_vars() if isinstance(mod[gv], tir.PrimFunc)})
+        plan = plan_graph(renamed)
+        duplicated += plan["constants_bytes"]
+        for tensor in plan["constants"]:
+            key = (tensor.dtype, tensor.shape, hashlib.sha256(tensor.value.tobytes()).hexdigest())
+            previous = unique.get(key)
+            if previous is not None:
+                if not np.array_equal(np.ascontiguousarray(previous.value).view("uint8"), np.ascontiguousarray(tensor.value).view("uint8")):
+                    raise ValueError("Constant digest collision")
+                tensor.offset = previous.offset
+            else:
+                tensor.offset = size
+                size = _aligned(size + tensor.nbytes)
+                unique[key] = tensor
+                pool.append(tensor)
+        stages.append((name, renamed, plan))
+    # Validate every stage before creating any artifacts. Each invocation maps
+    # the complete shared pool, rather than claiming all stages fit in isolation.
+    for _, _, plan in stages:
+        plan["constants_bytes"] = size
+        _memory_preflight(plan, memory_limit_bytes)
+    output_dir = checked_path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=False)
+    constant_path = output_dir / "constants.bin"
+    _write_constants(pool, size, constant_path)
+    (output_dir / "runtime.c").write_text('const char *model_last_error;\nvoid TVMAPISetLastError(const char *message) { model_last_error = message; }\n')
+    records = {}
+    declarations = ["#include <stdint.h>"]
+    for index, (name, mod, plan) in enumerate(stages):
+        prefix = f"stage_{index}_"
+        records[name] = _export_plan(mod, plan, destinations[name], target, memory_limit_bytes, prefix=prefix, shared_constants=constant_path)
+        declarations.append(f"int32_t {prefix}model_run(const void *const *inputs, void *const *outputs, uint8_t *workspace, uint64_t workspace_bytes);")
+        declarations.append(f"const char *{prefix}model_get_last_error(void);")
+    (output_dir / "model.h").write_text("\n".join(declarations) + "\n")
+    report = {"stages": records, "constants_bytes": size, "duplicated_stage_constants_bytes": duplicated,
+              "constants_sha256": _file_sha256(constant_path),
+              "maximum_stage_tensor_bytes": max(stage["explicit_tensor_bytes"] for stage in records.values()),
+              "serial_workspace_bytes": max(stage["workspace_bytes"] for stage in records.values()),
+              "memory_scope": "shared constants plus one stage invocation; retained session state, ELF, stack and fixtures are additional",
+              "state_routing": "caller_owned", "session_execution": False, "full_model_qualified": False, "timing_qualified": False}
+    (output_dir / "graphs.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return report

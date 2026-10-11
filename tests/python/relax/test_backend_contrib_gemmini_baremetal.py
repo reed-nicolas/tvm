@@ -30,7 +30,7 @@ from tvm import relax, tir
 
 APP = Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"
 sys.path.insert(0, str(APP))
-from baremetal import export_graph, plan_graph, preflight_graph
+from baremetal import export_graph, export_graphs, plan_graph, preflight_graph
 
 
 def aligned(shape, dtype):
@@ -40,9 +40,9 @@ def aligned(shape, dtype):
     return raw[start:start + int(np.prod(shape)) * dtype.itemsize].view(dtype).reshape(shape)
 
 
-def graph(dtype="int8", tuple_output=False, shape=(2, 3)):
+def graph(dtype="int8", tuple_output=False, shape=(2, 3), weight_offset=0):
     x = relax.Var("x", relax.TensorStructInfo(shape, dtype))
-    w = np.arange(12, dtype=dtype).reshape(3, 4) - 5
+    w = np.arange(12, dtype=dtype).reshape(3, 4) - 5 + weight_offset
     builder = relax.BlockBuilder()
     with builder.function("main", [x]):
         with builder.dataflow():
@@ -119,6 +119,53 @@ class StaticGraphTests(unittest.TestCase):
         ins = (ctypes.c_void_p * len(inputs))(*(array.ctypes.data for array in inputs))
         outs = (ctypes.c_void_p * len(outputs))(*(array.ctypes.data for array in outputs))
         return loaded.model_run(ins, outs, workspace.ctypes.data, workspace.nbytes if size is None else size)
+
+    def test_stage_bundle_shares_constants_and_links_distinct_entrypoints(self):
+        modules = {"prefill": graph(), "decode": graph(shape=(1, 3)), "private": graph(shape=(1, 3), weight_offset=1)}
+        before = {name: mod.script(show_meta=True) for name, mod in modules.items()}
+        report = export_graphs(modules, self.root / "bundle", target="llvm")
+        self.assertEqual(before, {name: mod.script(show_meta=True) for name, mod in modules.items()})
+        folder = self.root / "bundle"
+        self.assertLess(report["constants_bytes"], report["duplicated_stage_constants_bytes"])
+        self.assertGreater(report["constants_bytes"], plan_graph(modules["prefill"])["constants_bytes"])
+        self.assertFalse(report["session_execution"])
+        self.assertEqual(report["state_routing"], "caller_owned")
+        self.assertEqual(report["serial_workspace_bytes"], max(stage["workspace_bytes"] for stage in report["stages"].values()))
+        library = folder / "model.so"
+        sources = [folder / "runtime.c", folder / "constants.S"]
+        sources.extend(folder / stage / file for stage in report["stages"] for file in ("model.c", "operators.o"))
+        subprocess.run(["cc", "-shared", "-fPIC", "-std=c11", "-O2", *sources, "-o", library], check=True, capture_output=True)
+        loaded = ctypes.CDLL(str(library))
+        self.addCleanup(dlclose, loaded._handle)
+        workspace = aligned((max(report["serial_workspace_bytes"], 64),), "uint8")
+        retained = []
+        for name in ("prefill", "decode", "private", "prefill", "decode"):
+            stage = report["stages"][name]
+            runner = getattr(loaded, stage["entrypoint"])
+            runner.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint64]
+            runner.restype = ctypes.c_int32
+            value = aligned(stage["inputs"][0]["shape"], "int8")
+            value[:] = np.arange(value.size).reshape(value.shape) - 3
+            output = aligned(stage["outputs"][0]["shape"], "int32")
+            ins, outs = (ctypes.c_void_p * 1)(value.ctypes.data), (ctypes.c_void_p * 1)(output.ctypes.data)
+            expected = (value.astype("int64") @ (np.arange(12).reshape(3, 4) - 5 + (name == "private")) + 3) * 2 - 1
+            self.assertEqual(runner(ins, outs, workspace.ctypes.data, workspace.nbytes), 0)
+            np.testing.assert_array_equal(output, expected)
+            retained.append((output, expected.copy()))
+            self.assertEqual(runner(ins, ins, workspace.ctypes.data, workspace.nbytes), -2)
+            for old, reference in retained:
+                np.testing.assert_array_equal(old, reference)
+
+    def test_stage_bundle_preflights_all_stages_before_artifacts(self):
+        output = self.root / "refused"
+        limit = preflight_graph(graph())["allocated"]["explicit_tensor_bytes"]
+        with self.assertRaisesRegex(ValueError, "memory"):
+            export_graphs({"small": graph(), "large": graph(shape=(20, 3))}, output, target="llvm", memory_limit_bytes=limit)
+        self.assertFalse(output.exists())
+        for modules in ({}, {"bad-name": graph()}, {1: graph()}):
+            with self.assertRaisesRegex(ValueError, "C identifiers"):
+                export_graphs(modules, output, target="llvm")
+        self.assertFalse(output.exists())
 
     def test_mixed_dtype_calls_reuse_and_repeated_execution(self):
         report, loaded, inputs, outputs, workspace = self.compile(graph())
