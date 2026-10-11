@@ -330,3 +330,98 @@ class BoundedGemminiSearch:
                             "device_check": self.device_checks.get(candidate.candidate_id)} for candidate in self.candidates],
             "timings": [dict(record.__dict__, samples_seconds=list(record.samples_seconds)) for record in self.records],
         }
+
+
+def collect_gemmini_workloads(mod):
+    """Inventory semantic contractions; eligibility is not execution coverage."""
+    from tvm import relax
+    from .gemmini import DecomposeGemminiLinear, _eligible
+    from .gemmini_conv import DecomposeGemminiConv2D
+
+    semantic = DecomposeGemminiLinear()(DecomposeGemminiConv2D()(mod))
+    admitted, host = {}, []
+    for gv, function in semantic.functions_items():
+        if not isinstance(function, relax.Function):
+            continue
+        if function.attrs and ("Codegen" in function.attrs or "Composite" in function.attrs):
+            host.append({"function": gv.name_hint, "reason": "externally owned function"})
+            continue
+        calls = []
+        relax.analysis.post_order_visit(function.body, lambda node: calls.append(node) if isinstance(node, relax.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name in ("relax.matmul", "relax.nn.conv2d") else None)
+        for index, call in enumerate(calls):
+            site = gv.name_hint + ":" + call.op.name.removeprefix("relax.") + ":" + str(index)
+            shape = _eligible(call)
+            if shape is None or max(shape[2], shape[1] * 4) > (1 << 32) - 1:
+                host.append({"site": site, "reason": "unsupported static INT8/INT32 primitive contract"})
+            else:
+                admitted.setdefault(shape, []).append(site)
+    return {"workloads": [{"shape": list(shape), "sites": sites} for shape, sites in sorted(admitted.items())], "host_contractions": host, "execution_qualified": False}
+
+
+class GemminiModelSearch:
+    """Budget candidate measurements across model contraction shapes.
+
+    Requests bind build, adapter, workload and candidate identities. Callers execute
+    them, establish correctness and supply TimingRecords; this class never measures
+    a target or treats predictions as winners. Each shape retains its own cost model.
+    """
+
+    def __init__(self, inventory, *, budget, compiler_id, adapter_id, seed=0, allow_diagnostic=False):
+        if type(budget) is not int or budget < 1:
+            raise ValueError("Measurement budget must be a positive integer")
+        if not all(_nonempty(value) for value in (compiler_id, adapter_id)):
+            raise ValueError("Model search requires compiler and adapter identities")
+        shapes = tuple(tuple(item["shape"]) for item in inventory["workloads"])
+        if not shapes or len(set(shapes)) != len(shapes):
+            raise ValueError("Model search requires distinct admitted workloads")
+        self.inventory = deepcopy(inventory)
+        self.budget, self.compiler_id, self.adapter_id = budget, compiler_id, adapter_id
+        self.searches = {shape: BoundedGemminiSearch(*shape, seed=seed, allow_diagnostic=allow_diagnostic, compiler_id=compiler_id, adapter_id=adapter_id) for shape in shapes}
+        self._by_workload = {search.workload_id: search for search in self.searches.values()}
+        self._issued, self._requests, self._cursor = set(), [], 0
+        self.measurement_domain = None
+
+    def next_measurements(self, count=1):
+        """Consume a finite budget in reproducible rounds without duplicate candidates."""
+        if type(count) is not int or count < 1:
+            raise ValueError("Requested measurement count must be positive")
+        requests, searches = [], tuple(self.searches.values())
+        issued, cursor = set(self._issued), self._cursor
+        empty_round = 0
+        while len(requests) < count and len(self._requests) + len(requests) < self.budget and empty_round < len(searches):
+            search = searches[cursor % len(searches)]
+            cursor += 1
+            proposal = next((item for item in search.rank() if item.candidate.candidate_id not in issued), None)
+            if proposal is None:
+                empty_round += 1
+                continue
+            empty_round = 0
+            candidate = proposal.candidate
+            request = {"request_index": len(self._requests) + len(requests), "workload_id": search.workload_id, "candidate_id": candidate.candidate_id, "shape": list(search.shape), "tile_i": candidate.schedule.metadata["tile_i"], "tile_j": candidate.schedule.metadata["tile_j"], "origin": proposal.origin, "compiler_id": self.compiler_id, "adapter_id": self.adapter_id, "minimum_timing_repeats": 2, "performance_winner": False}
+            issued.add(candidate.candidate_id)
+            requests.append(request)
+        self._issued, self._cursor = issued, cursor
+        self._requests.extend(deepcopy(requests))
+        return requests
+
+    def search_for(self, workload_id):
+        try:
+            return self._by_workload[workload_id]
+        except KeyError as error:
+            raise ValueError("Unknown model workload identity") from error
+
+    def ingest(self, record):
+        """Update one requested candidate after existing correctness/provenance gates."""
+        if not isinstance(record, TimingRecord) or record.candidate_id not in self._issued:
+            raise ValueError("Timings must refer to a requested model candidate")
+        search = self.search_for(record.workload_id)
+        domain = (record.platform_id, record.source, record.protocol_id, record.compiler_id, record.adapter_id)
+        if self.measurement_domain is not None and domain != self.measurement_domain:
+            raise ValueError("Model search cannot mix measurement domains")
+        if any(value.candidate_id == record.candidate_id for value in search.records):
+            raise ValueError("Candidate already has a repeated-sample measurement")
+        search.update([record])
+        self.measurement_domain = domain
+
+    def manifest(self):
+        return {"schema": "gemmini_model_search_v1", "inventory": deepcopy(self.inventory), "budget": self.budget, "issued": len(self._requests), "remaining_budget": max(0, self.budget - len(self._requests)), "requests": deepcopy(self._requests), "measurement_domain": self.measurement_domain, "workloads": [search.manifest() for search in self.searches.values()], "timing_qualified": False, "performance_winner": False, "required_ablations": ["untuned", "graph_baseline", "graph_optimized"], "session_timing_scope": "complete declared session, including required host, packing and conversion work"}

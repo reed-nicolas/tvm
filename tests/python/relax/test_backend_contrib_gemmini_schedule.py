@@ -363,7 +363,8 @@ class GemminiScheduleTests(unittest.TestCase):
             original = builder.get()
             for optimize in (False, True):
                 with self.subTest(shape=shape, optimize=optimize):
-                    lowered = prepare_gemmini_graph(original, 2, 2, optimize=optimize)
+                    choices = {(int(np.prod(shape[:-1])), 19, 33): (1, 4)} if optimize else None
+                    lowered = prepare_gemmini_graph(original, 2, 2, optimize=optimize, tile_choices=choices)
                     self.assertTrue(relax.analysis.well_formed(lowered))
                     vm, control = self.build_graph(lowered)
                     device_a = tvm.nd.array(a)

@@ -263,6 +263,105 @@ def test_semantic_failure_revokes_prior_gate(monkeypatch):
     assert not search.semantic_checks[candidate.candidate_id]["passed"]
 
 
+def test_model_workload_inventory_exposes_host_attention():
+    import tvm
+    from tvm import relax
+    from tvm.relax.backend.contrib.gemmini_tuning import collect_gemmini_workloads
+    a = relax.Var("a", relax.TensorStructInfo((2, 3, 17), "int8"))
+    weights = relax.Var("weights", relax.TensorStructInfo((17, 19), "int8"))
+    q = relax.Var("q", relax.TensorStructInfo((2, 3, 17), "float32"))
+    k = relax.Var("k", relax.TensorStructInfo((2, 17, 3), "float32"))
+    builder = relax.BlockBuilder()
+    with builder.function("main", [a, weights, q, k]):
+        with builder.dataflow():
+            first = builder.emit(relax.op.matmul(a, weights, out_dtype="int32"))
+            second = builder.emit(relax.op.matmul(a, weights, out_dtype="int32"))
+            attention = builder.emit(relax.op.matmul(q, k))
+            output = builder.emit_output(relax.Tuple([first, second, attention]))
+        builder.emit_func_output(output)
+    inventory = collect_gemmini_workloads(builder.get())
+    assert inventory["workloads"] == [{"shape": [6, 19, 17], "sites": ["main:matmul:0", "main:matmul:1"]}]
+    assert len(inventory["host_contractions"]) == 1
+    assert inventory["execution_qualified"] is False
+    image = relax.Var("image", relax.TensorStructInfo((1, 4, 5, 5), "int8"))
+    grouped_weight = relax.Var("grouped_weight", relax.TensorStructInfo((4, 2, 3, 3), "int8"))
+    builder = relax.BlockBuilder()
+    with builder.function("main", [image, grouped_weight]):
+        builder.emit_func_output(relax.op.nn.conv2d(image, grouped_weight, groups=2, out_dtype="int32"))
+    grouped = collect_gemmini_workloads(builder.get())
+    assert not grouped["workloads"] and len(grouped["host_contractions"]) == 1
+    assert grouped["host_contractions"][0]["site"].startswith("main:nn.conv2d:")
+
+
+def test_model_search_budget_identity_ingestion_and_atomic_failure():
+    from tvm.relax.backend.contrib.gemmini_tuning import GemminiModelSearch
+    inventory = {"workloads": [{"shape": [3, 5, 7], "sites": ["prefill:0"]}, {"shape": [1, 5, 7], "sites": ["decode:0"]}], "host_contractions": [], "execution_qualified": False}
+    session = GemminiModelSearch(inventory, budget=3, compiler_id="compiler", adapter_id="adapter", seed=7, allow_diagnostic=True)
+    second_search = tuple(session.searches.values())[1]
+    original_rank = second_search.rank
+    before = session.manifest()
+    def fail_rank():
+        raise RuntimeError("injected second-workload ranking failure")
+    second_search.rank = fail_rank
+    with pytest.raises(RuntimeError, match="ranking failure"):
+        session.next_measurements(2)
+    assert session.manifest() == before and session._cursor == 0
+    second_search.rank = original_rank
+    requests = session.next_measurements(2)
+    assert [request["shape"] for request in requests] == [[3, 5, 7], [1, 5, 7]]
+    search = session.search_for(requests[0]["workload_id"])
+    record = TimingRecord(requests[0]["candidate_id"], search.workload_id, "fixture", "diagnostic_synthetic", (0.1, 0.11), "explicit synthetic machinery labels", compiler_id="compiler", adapter_id="adapter")
+    before = session.manifest()
+    with pytest.raises(ValueError, match="semantic correctness"):
+        session.ingest(record)
+    assert session.manifest() == before
+    search.validate_semantics(record.candidate_id)
+    session.ingest(record)
+    assert session.measurement_domain[1] == "diagnostic_synthetic"
+    with pytest.raises(ValueError, match="already has"):
+        session.ingest(record)
+    with pytest.raises(ValueError, match="requested model"):
+        session.ingest(replace(record, candidate_id="unrequested"))
+    requests[0]["candidate_id"] = "external mutation"
+    assert session.manifest()["requests"][0]["candidate_id"] != "external mutation"
+    assert len(session.next_measurements(10)) == 1
+    assert session.next_measurements() == []
+    assert session.manifest()["remaining_budget"] == 0
+    assert session.manifest()["timing_qualified"] is False
+    assert session.manifest()["performance_winner"] is False
+
+
+
+def test_model_proposals_apply_per_shape_without_changing_semantics():
+    import tvm
+    from tvm import relax, tir
+    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+    from tvm.relax.backend.contrib.gemmini_tuning import GemminiModelSearch, collect_gemmini_workloads
+    a = relax.Var("a", relax.TensorStructInfo((3, 7), "int8"))
+    b = relax.Var("b", relax.TensorStructInfo((1, 7), "int8"))
+    weights = relax.const(np.arange(35, dtype="int8").reshape(7, 5))
+    builder = relax.BlockBuilder()
+    with builder.function("main", [a, b]):
+        with builder.dataflow():
+            first = builder.emit(relax.op.matmul(a, weights, out_dtype="int32"))
+            second = builder.emit(relax.op.matmul(b, weights, out_dtype="int32"))
+            output = builder.emit_output(relax.Tuple([first, second]))
+        builder.emit_func_output(output)
+    mod = builder.get()
+    session = GemminiModelSearch(collect_gemmini_workloads(mod), budget=2, compiler_id="compiler", adapter_id="adapter")
+    requests = session.next_measurements(2)
+    choices = {tuple(request["shape"]): (request["tile_i"], request["tile_j"]) for request in requests}
+    prepared = prepare_gemmini_graph(mod, tile_choices=choices)
+    boundaries = [function for function in prepared.functions.values() if isinstance(function, tir.PrimFunc) and function.attrs and "gemmini.m" in function.attrs]
+    assert len(boundaries) == 2
+    for function in boundaries:
+        shape = tuple(int(function.attrs["gemmini." + name]) for name in ("m", "n", "k"))
+        assert (int(function.attrs["gemmini.tile_i"]), int(function.attrs["gemmini.tile_j"])) == choices[shape]
+    for invalid in ({(3, 5, 7): (8, 1)}, {(True, 5, 7): (1, 1)}, {"shape": (1, 1)}):
+        with pytest.raises(ValueError, match="Tile choices"):
+            prepare_gemmini_graph(mod, tile_choices=invalid)
+
+
 if __name__ == "__main__":
     import tvm.testing
     tvm.testing.main()

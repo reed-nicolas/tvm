@@ -175,17 +175,27 @@ class LowerGemminiScheduledMatmul:
     Link the primitive C ABI with its pinned no-FSM hardware/header contract.
     """
 
-    def __init__(self, tile_i=1, tile_j=1):
+    def __init__(self, tile_i=1, tile_j=1, tile_choices=None):
         if any(type(x) is not int or x not in (1, 2, 4) for x in (tile_i, tile_j)):
             raise ValueError("Gemmini macro tiles must be 1, 2 or 4")
         self.tile_i = tile_i
         self.tile_j = tile_j
+        if tile_choices is not None:
+            if not isinstance(tile_choices, dict):
+                raise ValueError("Tile choices must be a dictionary")
+            for shape, tiles in tile_choices.items():
+                if not isinstance(shape, tuple) or len(shape) != 3 or any(type(value) is not int or value <= 0 for value in shape):
+                    raise ValueError("Tile choices require positive (M,N,K) shapes")
+                if not isinstance(tiles, tuple) or len(tiles) != 2 or any(type(value) is not int or value not in (1, 2, 4) for value in tiles):
+                    raise ValueError("Tile choices require legal (I,J) macro tiles")
+        self.tile_choices = dict(tile_choices or {})
 
     def transform_module(self, mod, _ctx):
         from .gemmini_schedule import make_gemmini_matmul  # pylint: disable=import-outside-toplevel
 
         def wrapper(m, n, k):
-            return make_gemmini_matmul(m, n, k, self.tile_i, self.tile_j).scheduled_mod["main"].without_attr("global_symbol").with_attr("op_pattern", 8)
+            tiles = self.tile_choices.get((m, n, k), (self.tile_i, self.tile_j))
+            return make_gemmini_matmul(m, n, k, *tiles).scheduled_mod["main"].without_attr("global_symbol").with_attr("op_pattern", 8)
 
         def eligible(call):
             shape = _eligible(call)
@@ -200,7 +210,7 @@ class LowerGemminiScheduledMatmul:
         return lowerer.builder_.get()
 
 
-def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True):
+def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=None):
     """Prepare a semantic Relax graph while keeping device calls opaque.
 
     Eligible integer convolutions first become explicit CPU packing/restoration
@@ -222,7 +232,7 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True):
     device-lowered module: generic FoldConstant may CPU-evaluate call_tir.
     Candidate search can pass its bound tile_i/tile_j without altering this order.
     """
-    lower = LowerGemminiScheduledMatmul(tile_i, tile_j)
+    lower = LowerGemminiScheduledMatmul(tile_i, tile_j, tile_choices)
     if type(optimize) is not bool:
         raise ValueError("optimize must be a boolean")
     if optimize:
