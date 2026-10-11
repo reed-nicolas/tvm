@@ -1256,9 +1256,35 @@ def _fold_bounded_closed_tensor(bb, value):
         folded = relax.transform.FoldConstant()(builder.get())["main"].body
     except TVMError:
         return None
+    bindings = {}
     if isinstance(folded, relax.SeqExpr):
+        bindings = {binding.var: binding.value for block in folded.blocks
+                    for binding in block.bindings if isinstance(binding, relax.VarBinding)}
         folded = folded.body
-    return folded if isinstance(folded, relax.Constant) else None
+    # FoldConstant may leave a scalar astype of a Constant because its
+    # legalizer returns a Constant rather than call_tir. Resolve only aliases
+    # and those real dtype conversions in this already-proved closed graph.
+    seen = set()
+
+    def literal(value, depth=0):
+        if depth >= 32 or value in seen or len(seen) >= 128:
+            return None
+        seen.add(value)
+        if isinstance(value, relax.Constant):
+            return value
+        if isinstance(value, relax.Var) and value in bindings:
+            return literal(bindings[value], depth + 1)
+        if (isinstance(value, relax.Call) and value.op == tvm.ir.Op.get("relax.astype")
+                and value.struct_info.ndim == 0):
+            child = literal(value.args[0], depth + 1)
+            if isinstance(child, relax.Constant) and child.struct_info.ndim == 0:
+                try:
+                    return Cast.cast(child, str(value.attrs.dtype))
+                except (TypeError, ValueError, OverflowError, TVMError):
+                    return None
+        return None
+
+    return literal(folded)
 
 
 class Reshape(OnnxOpConverter):
@@ -2661,11 +2687,51 @@ class Range(OnnxOpConverter):
     """Converts an onnx Range node into an equivalent Relax expression."""
 
     @classmethod
-    def _impl_v12(cls, bb, inputs, attr, params):
+    def _impl_v11(cls, bb, inputs, attr, params):
+        valid = {"float32", "float64", "int16", "int32", "int64"}
+        out_dtype = inputs[0].struct_info.dtype
+        if out_dtype not in valid or any(value.struct_info.dtype != out_dtype for value in inputs):
+            raise ValueError("Range requires identical schema-11 numeric dtypes")
+        if any(not isinstance(value.struct_info, relax.PrimStructInfo)
+               and (not isinstance(value.struct_info, relax.TensorStructInfo)
+                    or value.struct_info.ndim != 0) for value in inputs):
+            raise ValueError("Range inputs must be scalar tensors")
+        literals = [get_constant(value, params) for value in inputs]
+        literals = [relax.const(value.value.value, out_dtype)
+                    if isinstance(value, relax.PrimValue) and isinstance(value.value, (tir.IntImm, tir.FloatImm))
+                    else value if isinstance(value, relax.Constant)
+                    else _fold_bounded_closed_tensor(bb, value) for value in literals]
+        if any(isinstance(value, relax.Constant) and not _np.isfinite(constant_numpy(value).item())
+               for value in literals):
+            raise NotImplementedError("Range nonfinite scalar endpoints are unsupported")
+        if isinstance(literals[2], relax.Constant) and constant_numpy(literals[2]).item() == 0:
+            raise ValueError("Range delta must be nonzero")
+        if all(isinstance(value, relax.Constant) for value in literals):
+            values = [constant_numpy(value).item() for value in literals]
+            # Proof-only subset: exact integral progressions. This preserves
+            # both schema-11's float32 count and repeated typed Add semantics,
+            # without generalizing NumPy's floating-point range algorithm.
+            if all(int(value) == value for value in values):
+                start_int, limit_int, step_int = map(int, values)
+                difference = limit_int - start_int
+                bounds = _np.iinfo(out_dtype) if out_dtype.startswith("int") else None
+                precision = 24 if out_dtype == "float32" else 53
+                exact_count_inputs = abs(difference) <= 2**24 and abs(step_int) <= 2**24
+                exact_difference = bounds is None or bounds.min <= difference <= bounds.max
+                count = max(difference // step_int, 0)
+                exact_output = (bounds is not None or max(abs(start_int), abs(limit_int)) <= 2**precision)
+                signed_zero = bounds is None and any(value == 0 and _np.signbit(value) for value in values)
+                if (exact_count_inputs and exact_difference and exact_output
+                        and not signed_zero
+                        and difference % step_int == 0
+                        and count * tvm.DataType(out_dtype).bits // 8 <= 65536):
+                    return relax.const(_np.arange(start_int, limit_int, step_int, dtype=out_dtype), out_dtype)
+
+        # Retain the existing runtime path for input-dependent, oversized or
+        # numerically unproved endpoints. No static shape assertion is added.
         start = get_constant(inputs[0], params)
         limit = get_constant(inputs[1], params)
         delta = get_constant(inputs[2], params)
-        out_dtype = start.struct_info.dtype
 
         if isinstance(start, relax.Constant):
             start = constant_numpy(start).tolist()
@@ -2675,11 +2741,6 @@ class Range(OnnxOpConverter):
 
         assert isinstance(delta, relax.Constant), "Constant delta required for Range."
         step = constant_numpy(delta).tolist()
-
-        # If all inputs are constant, compute directly.
-        if isinstance(start, int) and isinstance(limit, int):
-            out_range = _np.arange(start=start, stop=limit, step=step)
-            return relax.const(out_range, out_dtype)
 
         # Otherwise compute in graph.
         return bb.emit_te(topi.arange, start, limit, step, out_dtype)

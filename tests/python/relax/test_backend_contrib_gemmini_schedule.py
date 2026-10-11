@@ -880,6 +880,143 @@ class GemminiScheduleTests(unittest.TestCase):
             self.assertTrue(relax.analysis.well_formed(builder.get()))
             tvm.ir.assert_structural_equal(builder.get()["main"].ret_struct_info, x.struct_info)
 
+    def test_onnx_closed_scalar_cast_range_shapes_match_reference_and_llvm(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx import from_onnx
+        from tvm.relax.frontend.onnx.onnx_frontend import _fold_bounded_closed_tensor
+        initializers = [onnx.numpy_helper.from_array(value, name) for name, value in (
+            ("shape", np.array([32], "int64")), ("one", np.array(True)),
+            ("axis", np.array([0], "int64")), ("start", np.float32(0)),
+            ("step", np.float32(1)))]
+        nodes = [onnx.helper.make_node("Expand", ["one", "shape"], ["ones"]),
+                 onnx.helper.make_node("Cast", ["ones"], ["integers"], to=onnx.TensorProto.INT64),
+                 onnx.helper.make_node("ReduceSum", ["integers", "axis"], ["sum"], keepdims=0),
+                 onnx.helper.make_node("Cast", ["sum"], ["end"], to=onnx.TensorProto.FLOAT),
+                 onnx.helper.make_node("Range", ["start", "end", "step"], ["range"]),
+                 onnx.helper.make_node("Greater", ["range", "compare"], ["greater"]),
+                 onnx.helper.make_node("Shape", ["range"], ["range_shape"]),
+                 onnx.helper.make_node("Expand", ["one", "range_shape"], ["mask"]),
+                 onnx.helper.make_node("And", ["greater", "mask"], ["out"])]
+        outputs = [onnx.helper.make_tensor_value_info("range", onnx.TensorProto.FLOAT, [32]),
+                   onnx.helper.make_tensor_value_info("out", onnx.TensorProto.BOOL, [32])]
+        compare = np.arange(32, dtype="float32") - 1
+        model = onnx.helper.make_model(onnx.helper.make_graph(nodes, "closed_range", [onnx.helper.make_tensor_value_info("compare", onnx.TensorProto.FLOAT, [32])], outputs, initializers), opset_imports=[onnx.helper.make_opsetid("", 22)])
+        expected = ReferenceEvaluator(model).run(None, {"compare": compare})
+        mod = from_onnx(model, keep_params_in_input=False)
+        vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+        actual = vm["main"](tvm.nd.array(compare))
+        for value, reference in zip(actual, expected):
+            self.assertEqual(value.numpy().dtype, reference.dtype)
+            np.testing.assert_array_equal(value.numpy(), reference)
+        # A real, lossy scalar conversion must execute before using a literal.
+        builder = relax.BlockBuilder()
+        with builder.function("main", []):
+            with builder.dataflow():
+                converted = builder.emit(relax.op.astype(relax.const(2**24 + 1, "int64"), "float32"))
+                binding = builder.lookup_binding(converted)
+                folded = _fold_bounded_closed_tensor(builder, converted)
+                self.assertEqual(folded.struct_info.dtype, "float32")
+                self.assertEqual(folded.data.numpy().item(), np.float32(2**24 + 1))
+                self.assertTrue(builder.lookup_binding(converted).same_as(binding))
+                output = builder.emit_output(converted)
+            builder.emit_func_output(output)
+
+    def test_onnx_range_exact_integral_progressions_and_empty_import_semantics(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx.onnx_frontend import Range
+        cases = (("float32", (0, 32, 1)), ("float64", (10, 4, -2)),
+                 ("int16", (-3, 3, 2)), ("int32", (10, 4, -2)),
+                 ("int64", (0, 8, 2)), ("float32", (0, -1, 1)))
+        for dtype, scalars in cases:
+            with self.subTest(dtype=dtype, scalars=scalars):
+                values = [np.array(value, dtype=dtype) for value in scalars]
+                kind = onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+                names = ["start", "end", "step"]
+                graph = onnx.helper.make_graph([onnx.helper.make_node("Range", names, ["out"])], "range", [onnx.helper.make_tensor_value_info(name, kind, []) for name in names], [onnx.helper.make_tensor_value_info("out", kind, None)])
+                model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 11)])
+                expected = ReferenceEvaluator(model).run(None, dict(zip(names, values)))[0]
+                result = Range.get_converter(11)(relax.BlockBuilder(), [relax.const(value, dtype) for value in values], {}, [{}, {}])
+                self.assertIsInstance(result, relax.Constant)
+                self.assertEqual(result.struct_info.dtype, dtype)
+                np.testing.assert_array_equal(result.data.numpy(), expected)
+                # Existing empty-constant VM serialization is unsupported;
+                # check its importer payload/shape independently above.
+                if expected.size:
+                    builder = relax.BlockBuilder()
+                    with builder.function("main", []):
+                        builder.emit_func_output(result)
+                    vm = relax.VirtualMachine(relax.build(builder.get(), "llvm"), tvm.cpu())
+                    actual = vm["main"]().numpy()
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    np.testing.assert_array_equal(actual, expected)
+
+    def test_onnx_range_unproved_endpoints_keep_runtime_and_invalid_inputs_refuse(self):
+        from unittest.mock import patch
+        from tvm.relax.frontend.onnx.onnx_frontend import Range
+        for scalars in ((0, 4, 0), (0, np.inf, 1), (np.nan, 4, 1)):
+            with self.assertRaises((ValueError, NotImplementedError)):
+                Range.get_converter(11)(relax.BlockBuilder(), [relax.const(np.float32(value)) for value in scalars], {}, [{}, {}])
+        for values in ([relax.const(np.array([0], "float32")), relax.const(np.float32(4)), relax.const(np.float32(1))],
+                       [relax.const(np.float16(value)) for value in (0, 4, 1)],
+                       [relax.const(np.float32(0), "float32"), relax.const(np.float64(4), "float64"), relax.const(np.float32(1), "float32")]):
+            with self.assertRaises(ValueError):
+                Range.get_converter(11)(relax.BlockBuilder(), values, {}, [{}, {}])
+        unproved = (("float32", (0., 20000., 1.)), ("float32", (0., 4., 0.5)),
+                    ("float32", (2**24 + 2., 2**24 + 4., 2.)), ("float32", (-0., 4., 1.)),
+                    ("float64", (0, 2**24 + 1, 2**24 + 1)), ("int16", (-32768, 32767, 1)))
+        for dtype, scalars in unproved:
+            builder = relax.BlockBuilder()
+            with builder.function("main", []):
+                with patch.object(np, "arange") as materialize:
+                    output = Range.get_converter(11)(builder, [relax.const(np.array(value, dtype=dtype), dtype) for value in scalars], {}, [{}, {}])
+                    materialize.assert_not_called()
+                self.assertIsInstance(output, relax.Var)
+                self.assertEqual(builder.lookup_binding(output).op, tvm.ir.Op.get("relax.call_tir"))
+                builder.emit_func_output(output)
+        # Scalar endpoint is observation-dependent: no value specialization.
+        builder = relax.BlockBuilder()
+        end = relax.Var("end", relax.TensorStructInfo([], "float32"))
+        with builder.function("main", [end]):
+            output = Range.get_converter(11)(builder, [relax.const(np.float32(0)), end, relax.const(np.float32(1))], {}, [{}, {}])
+            self.assertIsInstance(output, relax.Var)
+            builder.emit_func_output(output)
+        # Closed scalar still refuses if its producer exceeds the old budget.
+        builder = relax.BlockBuilder()
+        with builder.function("main", []):
+            with builder.dataflow():
+                large = builder.emit(relax.op.broadcast_to(relax.const(1, "int64"), [8193]))
+                total = builder.emit(relax.op.sum(large))
+                end = builder.emit(relax.op.astype(total, "float32"))
+                binding = builder.lookup_binding(end)
+                with patch.object(np, "arange") as materialize:
+                    output = Range.get_converter(11)(builder, [relax.const(np.float32(0)), end, relax.const(np.float32(1))], {}, [{}, {}])
+                    materialize.assert_not_called()
+                self.assertIsInstance(output, relax.Var)
+                self.assertTrue(builder.lookup_binding(end).same_as(binding))
+                output = builder.emit_output(output)
+            builder.emit_func_output(output)
+
+    def test_onnx_range_literal_and_symbolic_primitive_scalar_compatibility(self):
+        from tvm.relax.frontend.onnx.onnx_frontend import Range
+        for dtype, scalar in (("int64", tir.IntImm), ("float32", tir.FloatImm)):
+            result = Range.get_converter(11)(relax.BlockBuilder(), [relax.PrimValue(scalar(dtype, value)) for value in (0, 8, 2)], {}, [{}, {}])
+            self.assertIsInstance(result, relax.Constant)
+            self.assertEqual(result.struct_info.dtype, dtype)
+            np.testing.assert_array_equal(result.data.numpy(), np.array([0, 2, 4, 6], dtype=dtype))
+        with self.assertRaises(ValueError):
+            Range.get_converter(11)(relax.BlockBuilder(), [relax.const(0, "int64"), relax.PrimValue(tir.IntImm("int32", 8)), relax.const(1, "int64")], {}, [{}, {}])
+        n = tir.Var("n", "int64")
+        for endpoint in (n, n + 1):
+            builder = relax.BlockBuilder()
+            with builder.function("main", []):
+                output = Range.get_converter(11)(builder, [relax.const(0, "int64"), relax.PrimValue(endpoint), relax.const(1, "int64")], {}, [{}, {}])
+                self.assertIsInstance(output, relax.Var)
+                self.assertEqual(builder.lookup_binding(output).op, tvm.ir.Op.get("relax.call_tir"))
+                self.assertEqual(output.struct_info.dtype, "int64")
+                builder.emit_func_output(output)
+
     def test_onnx_round_ties_even_and_signed_zero(self):
         import onnx
         from tvm.relax.frontend.onnx import from_onnx
