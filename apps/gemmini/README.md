@@ -214,7 +214,15 @@ python "$TVM_ROOT/apps/gemmini/verify_exported_graph.py" --graph-dir /absolute/p
   --repeats 2 --timeout-seconds 7200 --output-dir "$BUILD_ROOT/exported-graph-new-run"
 ```
 
-The verifier checks every sample on each repeat against frozen little-endian output bytes. It validates typed manifest extents, binds generated fixture blobs, checks their linked ELF symbols, poisons workspace/output padding, retains previous outputs, preserves inputs/constants and counts primitive calls from the selected TIR schedules. Missing-extension and deliberately wrong-oracle controls must fail. Eight direct admission tests and bounded mixed-output simulator checks pass, including BF16 nearest-even ties and FP64 increments below FP32 precision.
+The verifier checks every sample on each repeat against frozen little-endian output bytes. It validates typed manifest extents, binds generated fixture blobs, checks their linked ELF symbols, poisons workspace/output padding, retains previous outputs, preserves inputs/constants and counts primitive calls from the selected TIR schedules. Missing-extension and deliberately wrong-oracle controls must fail. Focused admission tests and bounded mixed-output simulator checks pass, including BF16 nearest-even ties and FP64 increments below FP32 precision.
+
+For a package from `export_graphs`, pass its root as `--graph-dir` and add `--session-route /absolute/path/to/route.json`:
+
+```json
+{"version": 1, "calls": [{"stage": "prefill", "inputs": [{"fixture": 0}]}, {"stage": "decode", "inputs": [{"fixture": 1}, {"output": [0, 0]}]}]}
+```
+
+Routes name contiguous external `input_N` fixtures or an earlier invocation/output with identical dtype and shape; they perform no conversion. Every packaged stage must execute. Flatten all invocation outputs in call order into the frozen `output_N` streams, including state and unused returns. The caller owns this explicit order and routing. Each sample/repeat starts fresh, retains every output, shares constants and reuses guarded workspace. Per-stage output/preservation/count checks supplement the existing final-image and failure controls. The 32-stage/64-call/256-tensor limits and 256-MiB guest map bound this verification trace; it is not an automatic model adapter, production memory plan or full-model qualification.
 
 Graphs requiring CPU math may explicitly repeat `--cpu-runtime-library /absolute/path/to/library.a` for the selected toolchain's libm, libc and libgcc dependencies. No library is selected by default. The verifier binds ordinary archive bytes/ABI, enables section garbage collection, distinguishes extracted members from retained sections and audits the final RV64GC/lp64d image for unsupported ISA, TLS, constructors and heap/file callbacks. The caller must select libraries compatible with this single-hart startup; these checks do not prove arbitrary library initialization semantics. The reviewed static errno state is valid under the ELF loader. A bounded generated math/Gemmini identity smoke passes; an independent nontrivial Decimal fixture retains an exact-byte failure at sinf(1), one ULP from correctly rounded output. Neither proves full-model or general libm accuracy.
 

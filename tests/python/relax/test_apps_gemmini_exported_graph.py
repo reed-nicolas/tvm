@@ -16,6 +16,10 @@
 """Fail-closed fixture admission before costly exported graph simulation."""
 
 from pathlib import Path
+import copy
+import hashlib
+import json
+import os
 import sys
 import tempfile
 import unittest
@@ -25,7 +29,7 @@ import numpy as np
 import tvm
 
 sys.path.insert(0, str(Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"))
-from verify_exported_graph import load_fixture, validate_manifest
+from verify_exported_graph import load_fixture, validate_manifest, validate_sequence, strict_json
 from verify_baremetal_cpu import bind_cpu_runtime
 
 
@@ -141,6 +145,151 @@ class FixtureAdmission(unittest.TestCase):
             np.savez(self.path, **arrays)
             with self.assertRaises(ValueError):
                 load_fixture(self.path, self.manifest)
+
+
+class SequenceAdmission(unittest.TestCase):
+    def setUp(self):
+        tensor = {"shape": [2], "dtype": "int32", "bytes": 8}
+        stage = {"inputs": [tensor], "outputs": [tensor, tensor], "constants": [], "intermediates": [],
+                 "constants_bytes": 0, "constants_sha256": "shared", "workspace_bytes": 64, "explicit_tensor_bytes": 88,
+                 "alignment_bytes": 64, "heap_required_by_orchestration": False, "runtime_workspace_allocator_required": False,
+                 "target": "llvm -mtriple=riscv64-unknown-elf", "calls": []}
+        self.package = {"stages": {"prefill": dict(stage, entrypoint="stage_1_model_run"), "cpu": dict(stage, entrypoint="stage_0_model_run")},
+                        "constants_bytes": 0, "constants_sha256": "shared", "duplicated_stage_constants_bytes": 0, "serial_workspace_bytes": 64,
+                        "maximum_stage_tensor_bytes": 88, "state_routing": "caller_owned", "session_execution": False}
+        self.route = {"version": 1, "calls": [{"stage": "prefill", "inputs": [{"fixture": 0}]},
+                                            {"stage": "cpu", "inputs": [{"output": [0, 1]}]},
+                                            {"stage": "cpu", "inputs": [{"fixture": 0}]}]}
+
+    def test_prior_output_fanout_fixture_reuse_and_all_outputs_retained(self):
+        manifest, calls = validate_sequence(self.package, self.route)
+        self.assertEqual(len(manifest["inputs"]), 1)
+        self.assertEqual(len(manifest["outputs"]), 6)
+        self.assertEqual(manifest["explicit_tensor_bytes"], 120)
+        self.assertEqual(calls[1]["inputs"], [("output", 1)])
+        self.assertEqual(calls[2]["outputs"], [4, 5])
+        route = copy.deepcopy(self.route)
+        route["calls"][2]["inputs"] = [{"output": [0, 1]}]
+        validate_sequence(self.package, route)
+
+    def test_future_cyclic_bool_sparse_unknown_and_extra_routes_refused(self):
+        for binding in ({"output": [1, 0]}, {"output": [0, -1]}, {"output": [False, 0]}, {"output": [0, True]},
+                        {"fixture": True}, {"fixture": 256}, {"fixture": 2}, {"transform": "cast"},
+                        {"fixture": 0, "output": [0, 0]}):
+            route = copy.deepcopy(self.route)
+            route["calls"][1]["inputs"] = [binding]
+            with self.subTest(binding=binding), self.assertRaises(ValueError):
+                validate_sequence(self.package, route)
+        for mutation in ({"version": True}, {"calls": []}, {"calls": self.route["calls"] * 22}, {"extra": 0}):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                validate_sequence(self.package, dict(self.route, **mutation))
+        route = copy.deepcopy(self.route)
+        route["calls"][0]["stage"] = "unknown"
+        with self.assertRaises(ValueError):
+            validate_sequence(self.package, route)
+
+    def test_stage_dtype_envelope_allocator_namespace_and_budget_refused(self):
+        for field, value in (("inputs", [{"shape": [1, 2], "dtype": "int32", "bytes": 8}]),
+                             ("inputs", [{"shape": [2], "dtype": "float32", "bytes": 8}]),
+                             ("entrypoint", "stage_1_model_run"), ("entrypoint", "invalid-symbol"),
+                             ("runtime_workspace_allocator_required", True), ("heap_required_by_orchestration", True),
+                             ("alignment_bytes", 32), ("constants_sha256", "different")):
+            package = copy.deepcopy(self.package)
+            package["stages"]["cpu"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                validate_sequence(package, self.route)
+        for field in ("serial_workspace_bytes", "maximum_stage_tensor_bytes"):
+            package = dict(self.package, **{field: 1})
+            with self.assertRaises(ValueError):
+                validate_sequence(package, self.route)
+        for field in ("constants_bytes", "duplicated_stage_constants_bytes", "serial_workspace_bytes", "maximum_stage_tensor_bytes"):
+            for value in (False, float(self.package[field])):
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, "plain"):
+                    validate_sequence(dict(self.package, **{field: value}), self.route)
+        package = copy.deepcopy(self.package)
+        for stage in package["stages"].values():
+            stage["workspace_bytes"] = 1 << 30
+            stage["explicit_tensor_bytes"] = (1 << 30) + 24
+        package.update(serial_workspace_bytes=1 << 30, maximum_stage_tensor_bytes=(1 << 30) + 24)
+        with self.assertRaisesRegex(ValueError, "guest budget"):
+            validate_sequence(package, self.route)
+        route = dict(self.route, calls=self.route["calls"][:1])
+        with self.assertRaisesRegex(ValueError, "Every stage"):
+            validate_sequence(self.package, route)
+
+    def test_duplicate_route_json_fields_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "route.json"
+            path.write_text('{"version":1,"version":1,"calls":[]}')
+            with self.assertRaisesRegex(ValueError, "Duplicate"):
+                strict_json(path)
+
+    def test_real_exported_sequence_with_independent_frozen_fixture(self):
+        from tvm import relax
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+        from baremetal import export_graphs
+        with tempfile.TemporaryDirectory() as directory:
+            selected = os.environ.get("TVM_EXPORTED_SEQUENCE_FIXTURE")
+            root = Path(selected) if selected else Path(directory) / "fixture"
+            root.mkdir(parents=True, exist_ok=False)
+            weight = np.array([[1, -2], [3, 4], [-5, 6]], dtype="int8")
+            modules = {}
+            for name in ("prefill", "decode", "finish"):
+                x = relax.Var("x", relax.TensorStructInfo((1, 3), "int8"))
+                raw = relax.Var("raw", relax.TensorStructInfo((4,), "bfloat16"))
+                precise = relax.Var("precise", relax.TensorStructInfo((2,), "float64"))
+                state = relax.Var("state", relax.TensorStructInfo((1, 2), "int32"))
+                builder = relax.BlockBuilder()
+                inputs = [x, raw, precise] if name == "prefill" else [state, raw, precise] if name == "finish" else [x, state, raw, precise]
+                with builder.function("main", inputs):
+                    with builder.dataflow():
+                        dot = state if name == "finish" else builder.emit(relax.op.matmul(x, relax.const(weight), out_dtype="int32"))
+                        shifted = builder.emit(relax.op.add(dot, relax.const(np.array([[3, 3]], dtype="int32"))))
+                        result = shifted if name in ("prefill", "finish") else builder.emit(relax.op.add(shifted, state))
+                        high = builder.emit(relax.op.add(precise, relax.const(2**-40, "float64")))
+                        output = builder.emit_output(relax.Tuple([result, raw, high]))
+                    builder.emit_func_output(output)
+                modules[name] = prepare_gemmini_graph(builder.get(), optimize=True)
+            package = export_graphs(modules, root / "graphs")
+            route = {"version": 1, "calls": [{"stage": "prefill", "inputs": [{"fixture": 0}, {"fixture": 1}, {"fixture": 2}]},
+                                              {"stage": "decode", "inputs": [{"fixture": 3}, {"output": [0, 0]}, {"output": [0, 1]}, {"output": [0, 2]}]},
+                                              {"stage": "decode", "inputs": [{"fixture": 4}, {"output": [1, 0]}, {"output": [0, 1]}, {"output": [1, 2]}]},
+                                              {"stage": "decode", "inputs": [{"fixture": 3}, {"output": [2, 0]}, {"output": [2, 1]}, {"output": [2, 2]}]},
+                                              {"stage": "finish", "inputs": [{"output": [3, 0]}, {"output": [3, 1]}, {"output": [3, 2]}]}]}
+            manifest, calls = validate_sequence(package, route)
+            arrays = {"input_0": np.array([[[2, -3, 4]], [[-7, 6, -5]]], dtype="int8"),
+                      "input_1": np.array([[0, 0x8000, 1, 0xbf80], [0x3f81, 0x3f7f, 0x8001, 0x4000]], dtype="uint16"),
+                      "input_2": np.array([[1 + 2**-30, -0.0], [-3 - 2**-30, 2**-40]], dtype="float64"),
+                      "input_3": np.array([[[-1, 2, 3]], [[5, -4, 3]]], dtype="int8"),
+                      "input_4": np.array([[[7, 0, -2]], [[-1, -2, -3]]], dtype="int8")}
+            # Independent Python integer complete-K dot and exactly representable
+            # binary FP64 increments; neither exported code nor TVM is evaluated.
+            state = [[0, 0] for _ in range(2)]
+            high = arrays["input_2"].copy()
+            for ordinal, index in enumerate((0, 3, 4, 3)):
+                for sample in range(2):
+                    for column in range(2):
+                        state[sample][column] += 3 + sum(int(arrays[f"input_{index}"][sample, 0, k]) * int(weight[k, column]) for k in range(3))
+                high = high + 2**-40
+                arrays[f"output_{ordinal * 3}"] = np.array(state, dtype="int32").reshape(2, 1, 2)
+                arrays[f"output_{ordinal * 3 + 1}"] = arrays["input_1"].copy()
+                arrays[f"output_{ordinal * 3 + 2}"] = high.copy()
+            arrays["output_12"] = np.array([[value + 3 for value in row] for row in state], dtype="int32").reshape(2, 1, 2)
+            arrays["output_13"] = arrays["input_1"].copy()
+            arrays["output_14"] = high + 2**-40
+            np.savez(root / "fixture.npz", **arrays)
+            (root / "route.json").write_text(json.dumps(route, indent=2) + "\n")
+            provenance = {"fixture_sha256": hashlib.sha256((root / "fixture.npz").read_bytes()).hexdigest(),
+                          "reference_sources": [{"path": str(Path(__file__).resolve()), "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}],
+                          "reference_contract": "Python integer complete-K dots +3 and explicit prior-state sum; final all-CPU state +3; raw uint16 BF16 copies; exact binary FP64 increments 2^-40. Two reset fixtures, five explicit invocations, all fifteen outputs retained; no TVM/reference-model evaluation.",
+                          "sample_ids": ["bounded-sequence-fixture-0", "bounded-sequence-fixture-1"]}
+            (root / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+            actual, samples = load_fixture(root / "fixture.npz", manifest)
+            self.assertEqual(samples, 2)
+            self.assertEqual(len(manifest["outputs"]), 15)
+            self.assertGreater(package["duplicated_stage_constants_bytes"], package["constants_bytes"])
+            for key in arrays:
+                self.assertEqual(actual[key].tobytes(), arrays[key].tobytes())
 
 
 if __name__ == "__main__":
