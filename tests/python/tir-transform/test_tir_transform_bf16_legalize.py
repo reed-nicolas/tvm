@@ -139,14 +139,43 @@ def test_bf16_copy_to_promoted_buffer():
             B[i] = f32tobf16(C[i])
 
     before = tvm.IRModule({"main": copy})
-    after = tvm.tir.transform.BF16ComputeLegalize()(before)
-    tvm.ir.assert_structural_equal(after, tvm.IRModule({"main": expected}))
-    tvm.ir.assert_structural_equal(tvm.tir.transform.BF16ComputeLegalize()(after), after)
     words = np.array([15616, 48896, 16256, 49152], dtype=np.uint16)
     source = tvm.nd.array(words.view(ml_dtypes.bfloat16))
-    result = tvm.nd.empty((4,), "bfloat16")
-    tvm.build(before, "llvm")(source, result)
-    np.testing.assert_array_equal(result.numpy(), words)
+    for vectorized in (False, True):
+        candidate, oracle = before, tvm.IRModule({"main": expected})
+        if vectorized:
+            def vectorize(stmt):
+                if isinstance(stmt, tvm.tir.For):
+                    return tvm.tir.For(stmt.loop_var, stmt.min, stmt.extent, tvm.tir.ForKind.VECTORIZED, stmt.body)
+            candidate = tvm.IRModule({"main": candidate["main"].with_body(tvm.tir.stmt_functor.ir_transform(candidate["main"].body, None, vectorize, ["tir.For"]))})
+            candidate = tvm.tir.transform.VectorizeLoop()(candidate)
+            oracle = tvm.IRModule({"main": oracle["main"].with_body(tvm.tir.stmt_functor.ir_transform(oracle["main"].body, None, vectorize, ["tir.For"]))})
+            oracle = tvm.tir.transform.VectorizeLoop()(oracle)
+        after = tvm.tir.transform.BF16ComputeLegalize()(candidate)
+        tvm.ir.assert_structural_equal(after, oracle)
+        tvm.ir.assert_structural_equal(tvm.tir.transform.BF16ComputeLegalize()(after), after)
+        result = tvm.nd.empty((4,), "bfloat16")
+        tvm.build(candidate, "llvm")(source, result)
+        np.testing.assert_array_equal(result.numpy(), words)
+
+
+def test_bf16_cast_roundtrip_retains_rounding():
+    import numpy as np
+
+    @T.prim_func
+    def roundtrip(A: T.Buffer((4,), "float32"), B: T.Buffer((4,), "float32")):
+        T.func_attr({"global_symbol": "main", "tir.noalias": True})
+        workspace = T.allocate([4], "bfloat16", "global")
+        C = T.decl_buffer((4,), "bfloat16", data=workspace)
+        for i in range(4):
+            C[i] = T.Cast("bfloat16", A[i])
+        for i in range(4):
+            B[i] = T.Cast("float32", C[i]) * T.float32(1000)
+
+    values = np.array([.03126, -.501, 1.001, -2.005], dtype=np.float32)
+    result = tvm.nd.empty((4,), "float32")
+    tvm.build(roundtrip, "llvm")(tvm.nd.array(values), result)
+    np.testing.assert_array_equal(result.numpy(), np.array([31.25, -500, 1000, -2000], dtype=np.float32))
 
 
 def test_bf16_storage_scope():
