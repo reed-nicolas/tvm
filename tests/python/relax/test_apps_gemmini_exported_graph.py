@@ -188,6 +188,24 @@ class SequenceAdmission(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_sequence(self.package, route)
 
+    def test_static_signature_count_matches_the_call_bound(self):
+        for count in (33, 64):
+            package = copy.deepcopy(self.package)
+            stage = package["stages"]["prefill"]
+            package["stages"] = {f"signature_{index}": dict(stage, entrypoint=f"stage_{index}_model_run") for index in range(count)}
+            route = {"version": 1, "calls": [{"stage": f"signature_{index}", "inputs": [{"fixture": 0} if index == 0 else {"output": [index - 1, 0]}]} for index in range(count)]}
+            manifest, calls = validate_sequence(package, route)
+            self.assertEqual(len(calls), count)
+            self.assertEqual(len(manifest["outputs"]), count * 2)
+            self.assertEqual(manifest["explicit_tensor_bytes"], count * 16 + 72)
+        package["stages"]["signature_64"] = dict(stage, entrypoint="stage_64_model_run")
+        with self.assertRaisesRegex(ValueError, "64 named static stages"):
+            validate_sequence(package, route)
+        del package["stages"]["signature_64"]
+        route["calls"].append({"stage": "signature_0", "inputs": [{"fixture": 0}]})
+        with self.assertRaisesRegex(ValueError, "64 calls"):
+            validate_sequence(package, route)
+
     def test_stage_dtype_envelope_allocator_namespace_and_budget_refused(self):
         for field, value in (("inputs", [{"shape": [1, 2], "dtype": "int32", "bytes": 8}]),
                              ("inputs", [{"shape": [2], "dtype": "float32", "bytes": 8}]),

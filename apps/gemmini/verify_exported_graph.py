@@ -39,6 +39,7 @@ from verify_matmul_runtime import bind_runtime
 
 STORAGE_DTYPES = {name: np.dtype(name) for name in ("int8", "uint8", "int32", "int64", "float32", "float64", "bool")}
 STORAGE_DTYPES["bfloat16"] = np.dtype("uint16")
+MAX_SESSION_CALLS = 64
 
 
 RUNNER = r'''
@@ -163,8 +164,8 @@ def strict_json(path):
 def validate_sequence(package, route):
     """Admit a bounded explicit DAG; every invocation retains all its outputs."""
     stages = package.get("stages") if isinstance(package, dict) else None
-    if not isinstance(stages, dict) or not 1 <= len(stages) <= 32 or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in stages):
-        raise ValueError("Session requires one to 32 named static stages")
+    if not isinstance(stages, dict) or not 1 <= len(stages) <= MAX_SESSION_CALLS or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in stages):
+        raise ValueError(f"Session requires one to {MAX_SESSION_CALLS} named static stages")
     if package.get("state_routing") != "caller_owned" or package.get("session_execution") is not False:
         raise ValueError("Require an export_graphs package with caller-owned routing")
     for field in ("constants_bytes", "duplicated_stage_constants_bytes", "serial_workspace_bytes", "maximum_stage_tensor_bytes"):
@@ -187,8 +188,8 @@ def validate_sequence(package, route):
             raise ValueError("Stage calls require explicit C symbols")
     if package.get("serial_workspace_bytes") != max(stage["workspace_bytes"] for stage in stages.values()) or package.get("maximum_stage_tensor_bytes") != max(stage["explicit_tensor_bytes"] for stage in stages.values()):
         raise ValueError("Session storage summary differs from admitted stages")
-    if not isinstance(route, dict) or set(route) != {"version", "calls"} or type(route["version"]) is not int or route["version"] != 1 or not isinstance(route["calls"], list) or not 1 <= len(route["calls"]) <= 64:
-        raise ValueError("Require strict version-one routing with one to 64 calls")
+    if not isinstance(route, dict) or set(route) != {"version", "calls"} or type(route["version"]) is not int or route["version"] != 1 or not isinstance(route["calls"], list) or not 1 <= len(route["calls"]) <= MAX_SESSION_CALLS:
+        raise ValueError(f"Require strict version-one routing with one to {MAX_SESSION_CALLS} calls")
     fixtures, outputs, calls, used = {}, [], [], set()
     same = lambda tensor: (tensor["dtype"], tensor["shape"], tensor["bytes"])
     for ordinal, call in enumerate(route["calls"]):
