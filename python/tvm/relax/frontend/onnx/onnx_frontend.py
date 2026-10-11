@@ -3063,11 +3063,11 @@ class LayerNormalization(OnnxOpConverter):
             # Center before squaring to avoid cancellation from E[X^2]-E[X]^2.
             variance = bb.emit(relax.op.mean(relax.op.multiply(centered, centered), axis=axes, keepdims=True))
             inv_std = bb.emit(relax.op.rsqrt(relax.op.add(variance, relax.const(epsilon, "float32"))))
-            normalized = relax.op.multiply(centered, inv_std)
-            affine = relax.op.multiply(normalized, relax.op.astype(scale, "float32"))
+            # ONNX stash_type applies to standardization, not the affine stage.
+            normalized = bb.emit(relax.op.astype(relax.op.multiply(centered, inv_std), "bfloat16"))
+            output = bb.emit(relax.op.multiply(normalized, scale))
             if bias is not None:
-                affine = relax.op.add(affine, relax.op.astype(bias, "float32"))
-            output = relax.op.astype(affine, "bfloat16")
+                output = bb.emit(relax.op.add(output, bias))
             return relax.Tuple([output, mean, inv_std])
 
         output = relax.op.nn.layer_norm(data, scale, bias, axis, epsilon)

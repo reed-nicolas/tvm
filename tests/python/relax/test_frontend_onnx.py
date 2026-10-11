@@ -1384,6 +1384,51 @@ def test_mean_variance_norm():
     verify_unary("MeanVarianceNormalization", [1, 3, 32, 32], attrs={"axes": (1, 2, 3)})
 
 
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_bf16_layer_norm_preserves_stash_and_affine_rounding(has_bias):
+    import ml_dtypes
+
+    def round_bf16(value):
+        bits = np.asarray(value, dtype="float32").view("uint32")
+        words = ((bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)) >> 16).astype("uint16")
+        return (words.astype("uint32") << 16).view("float32")
+
+    data = np.array([[1, 2, 4], [-2, 1, 3]], dtype="float32")
+    scale = np.array([3, 1.5, -2], dtype="float32")
+    bias = np.array([0.25, 0.5, -0.125], dtype="float32")
+    epsilon = np.float32(1e-5)
+    mean = data.mean(axis=-1, keepdims=True, dtype="float32")
+    centered = data - mean
+    variance = (centered * centered).mean(axis=-1, keepdims=True, dtype="float32")
+    inv_std = np.float32(1) / np.sqrt(variance + epsilon)
+    normalized = centered * inv_std
+    expected = round_bf16(round_bf16(normalized) * scale)
+    unrounded_affine = normalized * scale
+    if has_bias:
+        expected = round_bf16(expected + bias)
+        unrounded_affine = unrounded_affine + bias
+    assert np.any(expected != round_bf16(unrounded_affine)), "Fixture must distinguish the ONNX stash boundary"
+    names = ["x", "scale"] + (["bias"] if has_bias else [])
+    outputs = [helper.make_tensor_value_info("y", TensorProto.BFLOAT16, [2, 3]), helper.make_tensor_value_info("mean", TensorProto.FLOAT, [2, 1]), helper.make_tensor_value_info("inv_std", TensorProto.FLOAT, [2, 1])]
+    initializers = [helper.make_tensor(name, TensorProto.BFLOAT16, value.shape, value.astype(ml_dtypes.bfloat16).tobytes(), raw=True) for name, value in zip(names[1:], (scale, bias))]
+    node = helper.make_node("LayerNormalization", names, ["y", "mean", "inv_std"], axis=-1, epsilon=float(epsilon), stash_type=1)
+    graph = helper.make_graph([node], "bf16_layer_norm_stash", [helper.make_tensor_value_info("x", TensorProto.BFLOAT16, [2, 3])], outputs, initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    onnx.checker.check_model(model)
+    mod = from_onnx(model, keep_params_in_input=False)
+    assert [field.dtype for field in mod["main"].ret_struct_info.fields] == ["bfloat16", "float32", "float32"]
+    for optimized in (False, True):
+        prepared = relax.get_pipeline("zero")(mod) if optimized else mod
+        vm = relax.VirtualMachine(relax.build(prepared, target="llvm"), tvm.cpu())
+        incoming = tvm.nd.array(data.astype(ml_dtypes.bfloat16))
+        original = incoming.numpy().copy()
+        actual = vm["main"](incoming)
+        np.testing.assert_array_equal(actual[0].numpy().view("uint16"), expected.astype(ml_dtypes.bfloat16).view("uint16"))
+        np.testing.assert_allclose(actual[1].numpy(), mean, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(actual[2].numpy(), inv_std, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(incoming.numpy().view("uint16"), original.view("uint16"))
+
+
 def test_layer_norm():
     layer_norm_node = helper.make_node("LayerNormalization", ["a", "b", "c"], ["d"], epsilon=1e-12)
 
