@@ -29,11 +29,23 @@ import numpy as np
 import tvm
 
 sys.path.insert(0, str(Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"))
-from verify_exported_graph import load_fixture, validate_manifest, validate_sequence, strict_json
+from verify_exported_graph import load_fixture, validate_manifest, validate_sequence, strict_json, guest_layout
 from verify_baremetal_cpu import bind_cpu_runtime
 
 
 class FixtureAdmission(unittest.TestCase):
+    def test_explicit_guest_map_and_linker_share_the_memory_budget(self):
+        from verify_baremetal_cpu import LINKER, GUEST_BYTES, GUEST_BASE, STACK_BYTES
+        linker, argument = guest_layout(GUEST_BYTES)
+        self.assertEqual(linker, LINKER)
+        self.assertEqual(argument, "-m0x80000000:0x10000000")
+        linker, argument = guest_layout(512 << 20)
+        self.assertIn("LENGTH = 0x20000000", linker)
+        self.assertEqual(argument, "-m0x80000000:0x20000000")
+        for invalid in (True, 0, STACK_BYTES, GUEST_BYTES + 1, float(GUEST_BYTES), (1 << 64) - GUEST_BASE + 4096):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                guest_layout(invalid)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="gemmini-exported-fixture-")
         self.addCleanup(self.directory.cleanup)
@@ -231,6 +243,8 @@ class SequenceAdmission(unittest.TestCase):
         package.update(serial_workspace_bytes=1 << 30, maximum_stage_tensor_bytes=(1 << 30) + 24)
         with self.assertRaisesRegex(ValueError, "guest budget"):
             validate_sequence(package, self.route)
+        manifest, _ = validate_sequence(package, self.route, guest_bytes=2 << 30)
+        self.assertGreater(manifest["explicit_tensor_bytes"], 1 << 30)
         route = dict(self.route, calls=self.route["calls"][:1])
         with self.assertRaisesRegex(ValueError, "Every stage"):
             validate_sequence(self.package, route)

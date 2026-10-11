@@ -161,8 +161,16 @@ def strict_json(path):
     return json.loads(checked_path(path).read_text(), object_pairs_hook=unique)
 
 
-def validate_sequence(package, route):
+def guest_layout(guest_bytes):
+    """Bind one explicit functional memory budget to linking and simulator admission."""
+    if type(guest_bytes) is not int or guest_bytes <= STACK_BYTES or guest_bytes % 4096 or GUEST_BASE + guest_bytes > 1 << 64:
+        raise ValueError("Guest memory requires a page-aligned RV64 span larger than the reserved stack")
+    return LINKER.replace(f"LENGTH = {GUEST_BYTES:#x}", f"LENGTH = {guest_bytes:#x}"), f"-m{GUEST_BASE:#x}:{guest_bytes:#x}"
+
+
+def validate_sequence(package, route, *, guest_bytes=GUEST_BYTES):
     """Admit a bounded explicit DAG; every invocation retains all its outputs."""
+    guest_layout(guest_bytes)
     stages = package.get("stages") if isinstance(package, dict) else None
     if not isinstance(stages, dict) or not 1 <= len(stages) <= MAX_SESSION_CALLS or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in stages):
         raise ValueError(f"Session requires one to {MAX_SESSION_CALLS} named static stages")
@@ -230,8 +238,8 @@ def validate_sequence(package, route):
         raise ValueError("Every stage must execute and fixture indices must be contiguous")
     inputs = [fixtures[index] for index in range(len(fixtures))]
     required = sum(tensor["bytes"] for tensor in [*inputs, *outputs]) + package["constants_bytes"] + package["serial_workspace_bytes"]
-    if required > GUEST_BYTES - STACK_BYTES:
-        raise ValueError("Retained session storage exceeds the fixed guest budget")
+    if required > guest_bytes - STACK_BYTES:
+        raise ValueError("Retained session storage exceeds the requested guest budget")
     aggregate = {"inputs": inputs, "outputs": outputs, "constants": [], "intermediates": [], "constants_bytes": package["constants_bytes"], "workspace_bytes": package["serial_workspace_bytes"], "explicit_tensor_bytes": required}
     validate_manifest(aggregate)
     return aggregate, calls
@@ -314,8 +322,9 @@ def load_fixture(path, manifest):
     return arrays, count
 
 
-def make_guest(out, manifest, arrays, samples, repeats, counts, *, sequence=None):
+def make_guest(out, manifest, arrays, samples, repeats, counts, *, sequence=None, guest_bytes=GUEST_BYTES):
     """Generate guarded caller storage and compare independent frozen byte blobs."""
+    linker, _ = guest_layout(guest_bytes)
     validate_manifest(manifest)
     declarations, initialization, initial_pointers = [], [], []
     prepare_inputs, prepare_outputs, check_inputs, check_outputs, check_guards = [], [], [], [], []
@@ -379,7 +388,7 @@ def make_guest(out, manifest, arrays, samples, repeats, counts, *, sequence=None
                    **{"EXPECTED_" + name.upper(): value for name, value in counts.items()}}
     (out / "fixture.h").write_text("\n".join(f"#define {name} UINT64_C({value})" for name, value in definitions.items()) + "\n")
     (out / "start.S").write_text(STARTUP)
-    (out / "link.ld").write_text(LINKER)
+    (out / "link.ld").write_text(linker)
 
 
 def main():
@@ -388,11 +397,16 @@ def main():
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--guest-memory-bytes", type=int, default=GUEST_BYTES, help="Explicit page-aligned functional Spike map; defaults to 256 MiB and does not declare deployed DRAM capacity")
     parser.add_argument("--session-route", type=Path, help="Opt-in strict fixed-sequence route JSON for an export_graphs package. Every invocation output requires independent fixture bytes.")
     parser.add_argument("--cpu-runtime-library", action="append", type=Path, default=[], help="Explicit ordinary RV64/lp64d static archive; repeat for each CPU runtime dependency. No libraries are selected by default.")
     args = parser.parse_args()
     if args.repeats < 2 or not 1 <= args.timeout_seconds <= 86400:
         parser.error("repeats must be at least two; timeout must be in [1,86400]")
+    try:
+        _, guest_map = guest_layout(args.guest_memory_bytes)
+    except ValueError as error:
+        parser.error(str(error))
     paths = {name: checked_path(value) for name, value in vars(args).items() if isinstance(value, Path)}
     out, app = paths["output_dir"], checked_path(Path(__file__).parent)
     out.mkdir(parents=True, exist_ok=False)
@@ -436,7 +450,7 @@ def main():
             report["route_artifact"] = bind(paths["session_route"])
             report["graph_artifacts"] = [bind(graph_dir / name) for name in ("graphs.json", "constants.S", "constants.bin", "runtime.c", "model.h")]
             package, route = strict_json(graph_dir / "graphs.json"), strict_json(paths["session_route"])
-            manifest, calls = validate_sequence(package, route)
+            manifest, calls = validate_sequence(package, route, guest_bytes=args.guest_memory_bytes)
             graphs = {}
             for name, stage in package["stages"].items():
                 folder = checked_path(graph_dir / name)
@@ -474,8 +488,8 @@ def main():
             # constructing artifacts; final ELF/stack extents are audited below.
             sizes = {group: [aligned_size(tensor["bytes"]) for tensor in manifest[group]] for group in ("inputs", "outputs")}
             guest_storage = sum(size + 128 for size in sizes["inputs"]) + 2 * sum(size + 128 for size in sizes["outputs"]) + max(64, aligned_size(manifest["workspace_bytes"])) + 128 + max(1, manifest["constants_bytes"]) + samples * sum(sizes["inputs"] + sizes["outputs"]) + STACK_BYTES
-            if guest_storage > GUEST_BYTES:
-                raise ValueError("Complete guarded fixture/trace storage exceeds the fixed guest budget")
+            if guest_storage > args.guest_memory_bytes:
+                raise ValueError("Complete guarded fixture/trace storage exceeds the requested guest budget")
             report["session"]["reserved_trace_fixture_stack_bytes"] = guest_storage
         sample_ids = provenance.get("sample_ids")
         if not isinstance(sample_ids, list) or len(sample_ids) != samples or any(not isinstance(value, str) or not value.strip() for value in sample_ids) or len(set(sample_ids)) != samples:
@@ -518,7 +532,7 @@ def main():
         if args.session_route is not None:
             sequence = (calls, package["stages"], stage_counts)
             report["session"]["expected_counts_per_stage"] = stage_counts
-        make_guest(out, manifest, arrays, samples, args.repeats, counts, sequence=sequence)
+        make_guest(out, manifest, arrays, samples, args.repeats, counts, sequence=sequence, guest_bytes=args.guest_memory_bytes)
         report["generated_fixtures"] = [bind(out / f"{kind}_{index}.bin") for kind in ("input", "output") for index in range(len(manifest[kind + "s"]))]
         report["generated_guest_sources"] = [bind(out / name) for name in ("runner.c", "fixture.h", "fixture.S", "start.S", "link.ld")]
         env = dict(os.environ)
@@ -558,9 +572,9 @@ def main():
                     symbol_sizes[fields[-1]] = int(fields[1], 16) if len(fields) == 4 else 0
                 except ValueError:
                     pass
-        if not segments or any(segment["start"] < GUEST_BASE or segment["start"] + segment["memory_bytes"] > GUEST_BASE + GUEST_BYTES for segment in segments):
+        if not segments or any(segment["start"] < GUEST_BASE or segment["start"] + segment["memory_bytes"] > GUEST_BASE + args.guest_memory_bytes for segment in segments):
             raise ValueError("ELF load extent exceeds requested memory")
-        if symbols["_stack_top"] - symbols["_stack_bottom"] != STACK_BYTES or symbols["_image_end"] > GUEST_BASE + GUEST_BYTES:
+        if symbols["_stack_top"] - symbols["_stack_bottom"] != STACK_BYTES or symbols["_image_end"] > GUEST_BASE + args.guest_memory_bytes:
             raise ValueError("Stack/image reservation mismatch")
         storage = ["model_constants", "workspace", *(f"input_{i}" for i in range(len(manifest["inputs"]))), *(f"output_{i}" for i in range(len(manifest["outputs"])))]
         if any(symbols[name] % 64 for name in storage):
@@ -576,12 +590,12 @@ def main():
                 fixture_symbols.append({"name": name, "address": address, "bytes": extent})
         report["fixture_symbols"] = fixture_symbols
         report["memory"] = {"load_segments": segments, "reserved_image_bytes": symbols["_image_end"] - GUEST_BASE,
-                            "requested_guest_bytes": GUEST_BYTES, "stack_reserved_bytes": STACK_BYTES,
+                            "requested_guest_bytes": args.guest_memory_bytes, "stack_reserved_bytes": STACK_BYTES,
                             "workspace_bytes": manifest["workspace_bytes"], "constants_bytes": manifest["constants_bytes"],
                             "explicit_tensor_bytes": manifest["explicit_tensor_bytes"], "parameter_copies": 1,
                             "scope": "requested generic Spike map; not deployed hardware capacity"}
         simulator_env = dict(env, LD_LIBRARY_PATH=str(paths["spike_library_dir"]), PATH=str(paths["dtc"].parent) + ":/usr/bin:/bin")
-        base = [paths["spike"], "--isa=rv64gc", "-m0x80000000:0x10000000", "-p1"]
+        base = [paths["spike"], "--isa=rv64gc", guest_map, "-p1"]
         missing = command([*base, programs["valid"]], "without-extension", simulator_env, expected="nonzero")
         if "EXPORTED_GRAPH_INPUT_REJECTION_PASS" not in missing:
             raise ValueError("Missing-extension control did not reach device dispatch")
