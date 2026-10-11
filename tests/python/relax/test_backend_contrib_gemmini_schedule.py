@@ -389,6 +389,21 @@ class GemminiScheduleTests(unittest.TestCase):
             mod = builder.get()
             tvm.ir.assert_structural_equal(DecomposeGemminiLinear()(mod), mod)
 
+    def test_onnx_round_ties_even_and_signed_zero(self):
+        import onnx
+        from tvm.relax.frontend.onnx import from_onnx
+        for dtype, kind in (("float16", onnx.TensorProto.FLOAT16), ("float32", onnx.TensorProto.FLOAT), ("float64", onnx.TensorProto.DOUBLE)):
+            ties = np.array([-3.5, -2.5, -1.5, -0.5, -0.25, -0., 0., 0.25, 0.5, 1.5, 2.5, 3.5], dtype=dtype)
+            values = np.concatenate((ties, np.nextafter(ties, np.array(np.inf, dtype=dtype)), np.nextafter(ties, np.array(-np.inf, dtype=dtype)), np.array([np.inf, -np.inf, np.nan, np.finfo(dtype).max], dtype=dtype)))
+            graph = onnx.helper.make_graph([onnx.helper.make_node("Round", ["input"], ["out"])], "round", [onnx.helper.make_tensor_value_info("input", kind, values.shape)], [onnx.helper.make_tensor_value_info("out", kind, values.shape)])
+            model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
+            mod = from_onnx(model, keep_params_in_input=False)
+            vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+            actual = vm["main"](tvm.nd.array(values)).numpy()
+            expected = np.rint(values)
+            np.testing.assert_array_equal(actual, expected)
+            np.testing.assert_array_equal(np.signbit(actual[expected == 0]), np.signbit(expected[expected == 0]))
+
     def test_onnx_integer_matmul_signed_zero_points_and_refusals(self):
         import onnx
         from tvm.relax.frontend.onnx import from_onnx

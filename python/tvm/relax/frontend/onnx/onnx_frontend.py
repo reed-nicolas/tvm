@@ -1781,7 +1781,18 @@ class Round(OnnxOpConverter):
 
     @classmethod
     def _impl_v1(cls, bb, inputs, attr, params):
-        return relax.op.round(inputs[0])
+        value = inputs[0]
+        dtype = value.struct_info.dtype
+        magnitude = bb.emit(relax.op.abs(value))
+        integral = bb.emit(relax.op.floor(magnitude))
+        fraction = bb.emit(relax.op.subtract(magnitude, integral))
+        half, one, two, zero = (relax.const(number, dtype) for number in (0.5, 1.0, 2.0, 0.0))
+        parity = bb.emit(relax.op.subtract(integral, relax.op.multiply(relax.op.floor(relax.op.divide(integral, two)), two)))
+        increment = relax.op.logical_or(relax.op.greater(fraction, half), relax.op.logical_and(relax.op.equal(fraction, half), relax.op.not_equal(parity, zero)))
+        rounded = bb.emit(relax.op.add(integral, relax.op.where(increment, one, zero)))
+        # ONNX requires ties to even; generic Relax round uses ties away. Preserve
+        # negative zero both from the input and from rounding a negative fraction.
+        return relax.op.where(relax.op.less(value, zero), relax.op.negative(rounded), relax.op.where(relax.op.equal(value, zero), value, rounded))
 
 
 class IsInf(OnnxOpConverter):
