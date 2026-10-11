@@ -469,6 +469,12 @@ class Pow(BinaryBase):
 
     @classmethod
     def _impl_v7(cls, bb, inputs, attr, params):
+        if all(isinstance(value, relax.Constant) for value in inputs):
+            dtype = inputs[0].struct_info.dtype
+            if dtype in ("float16", "float32", "float64") and inputs[1].struct_info.dtype == dtype:
+                # NumPy's floating pow can round differently from the target
+                # operation. Let Relax lower/fold it with the runtime arithmetic.
+                return cls.relax_op(inputs[0], inputs[1])
         return cls.base_impl(bb, inputs, attr, params)
 
 

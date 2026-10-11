@@ -1160,6 +1160,46 @@ def test_pow():
     verify_binary("Pow", [32, 32], [32, 32], [32, 32])
 
 
+@pytest.mark.parametrize("dtype", ["float16", "float32", "float64"])
+def test_constant_float_pow_matches_runtime(dtype):
+    from decimal import Decimal, localcontext
+
+    base = np.array([10000] * 32 + [-1, -0.0, 0, np.inf, np.nan], dtype=dtype)
+    exponent = np.array([i / 32 for i in range(32)] + [0.5, -3, -2, -1, 0], dtype=dtype)
+    tensor_type = {"float16": TensorProto.FLOAT16, "float32": TensorProto.FLOAT, "float64": TensorProto.DOUBLE}[dtype]
+    values = []
+    for constant in (False, True):
+        inputs = [] if constant else [helper.make_tensor_value_info(name, tensor_type, [37]) for name in ("base", "exponent")]
+        initializers = [onnx.numpy_helper.from_array(value, name) for name, value in (("base", base), ("exponent", exponent))] if constant else []
+        graph = helper.make_graph([helper.make_node("Pow", ["base", "exponent"], ["y"])], "pow_rounding", inputs, [helper.make_tensor_value_info("y", tensor_type, [37])], initializer=initializers)
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+        onnx.checker.check_model(model, full_check=True)
+        mod = from_onnx(model, keep_params_in_input=False)
+        arguments = [] if constant else [tvm.nd.array(base), tvm.nd.array(exponent)]
+        for optimized in (False, True):
+            prepared = relax.get_pipeline("zero")(mod) if optimized else mod
+            vm = relax.VirtualMachine(relax.build(prepared, "llvm"), tvm.cpu())
+            values.append(vm["main"](*arguments).numpy())
+    for value in values[1:]:
+        np.testing.assert_array_equal(value.view("uint" + str(value.dtype.itemsize * 8)), values[0].view("uint" + str(value.dtype.itemsize * 8)))
+    if dtype == "float32":
+        with localcontext() as context:
+            context.prec = 80
+            expected = np.float32(float(Decimal(10000) ** (Decimal(5) / 32)))
+        assert values[0][5].view("uint32") == expected.view("uint32")
+
+
+def test_integer_pow_constant_shape_arithmetic():
+    from tvm import tir
+    from tvm.relax.frontend.onnx.onnx_frontend import Pow
+
+    folded = Pow._impl_v7(None, [relax.const([2, 3, 4], "int64"), relax.const([0, 3, 2], "int64")], {}, {})
+    assert isinstance(folded, relax.Constant)
+    np.testing.assert_array_equal(folded.data.numpy(), np.array([1, 27, 16], dtype=np.int64))
+    scalar = Pow._impl_v7(None, [relax.PrimValue(tir.IntImm("int64", 2)), relax.PrimValue(tir.IntImm("int64", 3))], {}, {})
+    assert isinstance(scalar, relax.PrimValue) and scalar.value.value == 8
+
+
 @pytest.mark.parametrize("reverse", [False])
 @pytest.mark.parametrize("exclusive", [False])
 def test_cumsum(reverse, exclusive):
