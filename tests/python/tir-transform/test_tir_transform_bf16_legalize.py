@@ -73,7 +73,7 @@ def get_after_compute_legalize():
             D = T.decl_buffer((100,), "bfloat16", data=Dptr)
             C = T.decl_buffer((100,), "float32")
             for i in T.grid(100):
-                C[i] = bf16tof32(A[i]) + bf16tof32(B[i])
+                C[i] = bf16tof32(f32tobf16(bf16tof32(A[i]) + bf16tof32(B[i])))
                 D[i] = f32tobf16(T.exp(C[i]))
 
     return After
@@ -90,7 +90,7 @@ def get_after_storage_legalize():
             D = T.decl_buffer((100,), "uint16", data=Dptr)
             C = T.decl_buffer((100,), "float32")
             for i in T.grid(100):
-                C[i] = u16tof32(A[i]) + u16tof32(B[i])
+                C[i] = u16tof32(f32tou16(u16tof32(A[i]) + u16tof32(B[i])))
                 D[i] = f32tou16(T.exp(C[i]))
 
     return After
@@ -112,6 +112,14 @@ def test_bf16_storage_legalize():
     after = tvm.tir.transform.BF16StorageLegalize()(before)
     expected = get_after_storage_legalize()
     tvm.ir.assert_structural_equal(after, expected)
+
+
+def vectorize_loops(module):
+    def vectorize(stmt):
+        if isinstance(stmt, tvm.tir.For):
+            return tvm.tir.For(stmt.loop_var, stmt.min, stmt.extent, tvm.tir.ForKind.VECTORIZED, stmt.body)
+    body = tvm.tir.stmt_functor.ir_transform(module["main"].body, None, vectorize, ["tir.For"])
+    return tvm.tir.transform.VectorizeLoop()(tvm.IRModule({"main": module["main"].with_body(body)}))
 
 
 def test_bf16_copy_to_promoted_buffer():
@@ -144,13 +152,8 @@ def test_bf16_copy_to_promoted_buffer():
     for vectorized in (False, True):
         candidate, oracle = before, tvm.IRModule({"main": expected})
         if vectorized:
-            def vectorize(stmt):
-                if isinstance(stmt, tvm.tir.For):
-                    return tvm.tir.For(stmt.loop_var, stmt.min, stmt.extent, tvm.tir.ForKind.VECTORIZED, stmt.body)
-            candidate = tvm.IRModule({"main": candidate["main"].with_body(tvm.tir.stmt_functor.ir_transform(candidate["main"].body, None, vectorize, ["tir.For"]))})
-            candidate = tvm.tir.transform.VectorizeLoop()(candidate)
-            oracle = tvm.IRModule({"main": oracle["main"].with_body(tvm.tir.stmt_functor.ir_transform(oracle["main"].body, None, vectorize, ["tir.For"]))})
-            oracle = tvm.tir.transform.VectorizeLoop()(oracle)
+            candidate = vectorize_loops(candidate)
+            oracle = vectorize_loops(oracle)
         after = tvm.tir.transform.BF16ComputeLegalize()(candidate)
         tvm.ir.assert_structural_equal(after, oracle)
         tvm.ir.assert_structural_equal(tvm.tir.transform.BF16ComputeLegalize()(after), after)
@@ -176,6 +179,67 @@ def test_bf16_cast_roundtrip_retains_rounding():
     result = tvm.nd.empty((4,), "float32")
     tvm.build(roundtrip, "llvm")(tvm.nd.array(values), result)
     np.testing.assert_array_equal(result.numpy(), np.array([31.25, -500, 1000, -2000], dtype=np.float32))
+
+
+def test_bf16_implicit_store_retains_rounding():
+    import ml_dtypes
+    import numpy as np
+
+    @T.prim_func
+    def arithmetic(A: T.Buffer((4,), "bfloat16"), B: T.Buffer((4,), "bfloat16")):
+        T.func_attr({"global_symbol": "main", "tir.noalias": True})
+        workspace = T.allocate([4], "bfloat16", "global")
+        C = T.decl_buffer((4,), "bfloat16", data=workspace)
+        for i in range(4):
+            C[i] = A[i] + T.Cast("bfloat16", T.float32(0.00390625))
+        for i in range(4):
+            B[i] = C[i] * T.Cast("bfloat16", T.float32(1000))
+
+    source = tvm.nd.array(np.array([1, 1.0078125, -1, -1.0078125], dtype=ml_dtypes.bfloat16))
+    expected = np.array([1000, 1016, -996, -1000], dtype=ml_dtypes.bfloat16).view(np.uint16)
+    for vectorized in (False, True):
+        module = tvm.IRModule({"main": arithmetic})
+        if vectorized:
+            module = vectorize_loops(module)
+        legalized = tvm.tir.transform.BF16ComputeLegalize()(module)
+        tvm.ir.assert_structural_equal(tvm.tir.transform.BF16ComputeLegalize()(legalized), legalized)
+        result = tvm.nd.empty((4,), "bfloat16")
+        tvm.build(module, "llvm")(source, result)
+        np.testing.assert_array_equal(result.numpy(), expected)
+
+
+def test_bf16_store_preserves_accumulator_dtype():
+    import ml_dtypes
+    import numpy as np
+
+    @T.prim_func
+    def bf16_accumulator(A: T.Buffer((4,), "bfloat16"), B: T.Buffer((1,), "bfloat16")):
+        T.func_attr({"global_symbol": "main", "tir.noalias": True})
+        workspace = T.allocate([1], "bfloat16", "global")
+        C = T.decl_buffer((1,), "bfloat16", data=workspace)
+        C[0] = T.Cast("bfloat16", T.float32(1))
+        for k in range(4):
+            C[0] = C[0] + A[k]
+        B[0] = C[0]
+
+    @T.prim_func
+    def fp32_accumulator(A: T.Buffer((4,), "bfloat16"), B: T.Buffer((1,), "bfloat16")):
+        T.func_attr({"global_symbol": "main", "tir.noalias": True})
+        workspace = T.allocate([1], "float32", "global")
+        C = T.decl_buffer((1,), "float32", data=workspace)
+        C[0] = T.float32(1)
+        for k in range(4):
+            C[0] = C[0] + T.Cast("float32", A[k])
+        B[0] = T.Cast("bfloat16", C[0])
+
+    source = tvm.nd.array(np.full((4,), 0.00390625, dtype=ml_dtypes.bfloat16))
+    for function, expected in ((bf16_accumulator, 1), (fp32_accumulator, 1.015625)):
+        module = tvm.IRModule({"main": function})
+        legalized = tvm.tir.transform.BF16ComputeLegalize()(module)
+        tvm.ir.assert_structural_equal(tvm.tir.transform.BF16ComputeLegalize()(legalized), legalized)
+        result = tvm.nd.empty((1,), "bfloat16")
+        tvm.build(module, "llvm")(source, result)
+        np.testing.assert_array_equal(result.numpy(), np.array([expected], dtype=ml_dtypes.bfloat16).view(np.uint16))
 
 
 def test_bf16_storage_scope():
@@ -214,7 +278,7 @@ def test_bf16_storage_scope():
                 D = T.decl_buffer((100,), "bfloat16", data=Dptr)
                 C = T.decl_buffer((100,), "float32")
                 for i in T.grid(100):
-                    C[i] = bf16tof32(A[i]) + bf16tof32(B[i])
+                    C[i] = bf16tof32(f32tobf16(bf16tof32(A[i]) + bf16tof32(B[i])))
                     D[i] = f32tobf16(T.exp(C[i]))
 
         return After
@@ -234,7 +298,7 @@ def test_bf16_storage_scope():
                 D = T.decl_buffer((100,), "uint16", data=Dptr)
                 C = T.decl_buffer((100,), "float32")
                 for i in T.grid(100):
-                    C[i] = u16tof32(A[i]) + u16tof32(B[i])
+                    C[i] = u16tof32(f32tou16(u16tof32(A[i]) + u16tof32(B[i])))
                     D[i] = f32tou16(T.exp(C[i]))
 
         return After

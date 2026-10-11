@@ -319,10 +319,11 @@ class ComputeLegalizer : public StmtExprMutator {
     if (value.same_as(op->value) && indices.same_as(op->indices) && new_buf.same_as(op->buffer)) {
       return GetRef<Stmt>(op);
     } else {
-      if (MatchDType(new_buf->dtype)) {
+      // Preserve logical storage rounding even when physical storage is promoted.
+      if (MatchDType(op->buffer->dtype)) {
         int index_lanes = indices.size() ? indices.back().dtype().lanes() : 1;
-        int buffer_lanes = new_buf->dtype.lanes();
-        DataType legalized_dtype = new_buf->dtype.with_lanes(index_lanes * buffer_lanes);
+        int buffer_lanes = op->buffer->dtype.lanes();
+        DataType legalized_dtype = op->buffer->dtype.with_lanes(index_lanes * buffer_lanes);
         value = CastTargetToDType(value, legalized_dtype);
       }
       if (value.dtype().element_of() != new_buf->dtype.element_of()) {
