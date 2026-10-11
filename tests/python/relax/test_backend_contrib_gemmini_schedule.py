@@ -559,6 +559,75 @@ class GemminiScheduleTests(unittest.TestCase):
             indices = relax.Var("i", relax.TensorStructInfo(dtype="int64"))
             GatherND._impl_v13(relax.BlockBuilder(), [data, indices], {}, [{}, {}])
 
+    def test_onnx_reshape_closed_shape_calculation_matches_reference(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx import from_onnx
+        initializers = [
+            onnx.numpy_helper.from_array(np.float32(1), "one"),
+            onnx.numpy_helper.from_array(np.array([1, 6, 5], dtype="int64"), "grid_shape"),
+            onnx.numpy_helper.from_array(np.array([0], dtype="int64"), "axis"),
+            onnx.numpy_helper.from_array(np.array([1], dtype="int64"), "end"),
+            onnx.numpy_helper.from_array(np.int64(0), "index"),
+            onnx.numpy_helper.from_array(np.array([-1], dtype="int64"), "vector_shape"),
+        ]
+        nodes = [
+            onnx.helper.make_node("Expand", ["one", "grid_shape"], ["ones"]),
+            onnx.helper.make_node("Cast", ["ones"], ["mask"], to=onnx.TensorProto.BOOL),
+            onnx.helper.make_node("Slice", ["mask", "axis", "end", "axis"], ["slice"]),
+            onnx.helper.make_node("Squeeze", ["slice", "axis"], ["grid"]),
+            onnx.helper.make_node("Gather", ["grid", "index"], ["rows"], axis=1),
+            onnx.helper.make_node("Gather", ["grid", "index"], ["cols"], axis=0),
+            onnx.helper.make_node("Cast", ["rows"], ["rows_i"], to=onnx.TensorProto.INT64),
+            onnx.helper.make_node("Cast", ["cols"], ["cols_i"], to=onnx.TensorProto.INT64),
+            onnx.helper.make_node("ReduceSum", ["rows_i"], ["height"], keepdims=0),
+            onnx.helper.make_node("ReduceSum", ["cols_i"], ["width"], keepdims=0),
+            onnx.helper.make_node("Cast", ["height"], ["height_i"], to=onnx.TensorProto.INT64),
+            onnx.helper.make_node("Cast", ["width"], ["width_i"], to=onnx.TensorProto.INT64),
+            onnx.helper.make_node("Mul", ["height_i", "width_i"], ["count"]),
+            onnx.helper.make_node("Reshape", ["count", "vector_shape"], ["vector"]),
+            onnx.helper.make_node("Concat", ["vector"], ["target"], axis=0),
+            onnx.helper.make_node("Reshape", ["x", "target"], ["out"]),
+        ]
+        graph = onnx.helper.make_graph(nodes, "closed-shape",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [2, 15])],
+            [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.FLOAT, [30])], initializers)
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 22)])
+        source = model.SerializeToString()
+        value = np.arange(-15, 15, dtype="float32").reshape(2, 15)
+        expected = ReferenceEvaluator(model).run(None, {"x": value})[0]
+        mod = from_onnx(model, keep_params_in_input=False)
+        self.assertEqual(model.SerializeToString(), source)
+        self.assertEqual(tuple(int(dim) for dim in mod["main"].ret_struct_info.shape.values), (30,))
+        vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+        actual = vm["main"](tvm.nd.array(value)).numpy()
+        self.assertEqual(actual.dtype, value.dtype)
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_onnx_reshape_shape_folding_refuses_unknown_inputs_and_large_closures(self):
+        from unittest.mock import patch
+        from tvm.relax.frontend.onnx.onnx_frontend import Reshape
+        data = relax.Var("x", relax.TensorStructInfo((2, 3), "float32"))
+        unknown = relax.Var("shape", relax.TensorStructInfo((1,), "int64"))
+        with patch.object(relax.transform, "FoldConstant") as fold:
+            with self.assertRaisesRegex(NotImplementedError, "bounded closed shape calculation"):
+                Reshape._impl_v13(relax.BlockBuilder(), [data, unknown], {}, [{}, {}])
+            fold.assert_not_called()
+        builder = relax.BlockBuilder()
+        with builder.function("main", [data]):
+            with builder.dataflow():
+                # The result is one int64, but producing its sum would first
+                # materialize a 256 KiB tensor. Budget before invoking TVM.
+                large = builder.emit(relax.op.broadcast_to(relax.const(np.int64(1)), [256, 128]))
+                scalar = builder.emit(relax.op.sum(large))
+                shape = builder.emit(relax.op.reshape(scalar, [1]))
+                with patch.object(relax.transform, "FoldConstant") as fold:
+                    with self.assertRaisesRegex(NotImplementedError, "bounded closed shape calculation"):
+                        Reshape._impl_v13(builder, [data, shape], {}, [{}, {}])
+                    fold.assert_not_called()
+                output = builder.emit_output(data)
+            builder.emit_func_output(output)
+
     def test_onnx_round_ties_even_and_signed_zero(self):
         import onnx
         from tvm.relax.frontend.onnx import from_onnx

@@ -828,6 +828,10 @@ class Cast(OnnxOpConverter):
             if all([isinstance(x, tir.IntImm) for x in shape]):
                 shape = [int(x) for x in shape]
                 return relax.const(shape, to_type)
+        if isinstance(value.struct_info, relax.TensorStructInfo) and str(value.struct_info.dtype) == to_type:
+            # Same-dtype ONNX Cast preserves the tensor, including scalar bits.
+            # Avoid a redundant scalar astype that FoldConstant cannot fold.
+            return value
         if isinstance(value, relax.Constant):
             output = constant_numpy(value).astype(to_type)
             return relax.const(output, to_type)
@@ -1187,10 +1191,86 @@ class Gemm(OnnxOpConverter):
 class Reshape(OnnxOpConverter):
     """Convert an onnx Reshape node into an equivalent Relax expression."""
 
+    @staticmethod
+    def _fold_shape_input(bb, shape):
+        """Fold a bounded closed calculation used as a reshape shape."""
+        info = shape.struct_info
+        if not isinstance(info, relax.TensorStructInfo) or info.ndim != 1 or str(info.dtype) != "int64":
+            return None
+        allowed = {"relax.astype", "relax.broadcast_to", "relax.strided_slice", "relax.squeeze",
+                   "relax.take", "relax.sum", "relax.reshape", "relax.multiply", "relax.concat",
+                   "relax.expand_dims"}
+        memo, active, payload = {}, set(), [0]
+
+        def closed(value, depth=0):
+            if value in memo:
+                return memo[value]
+            if depth >= 32 or value in active or len(memo) + len(active) >= 128:
+                return None
+            active.add(value)
+            info = value.struct_info
+            if isinstance(info, relax.TensorStructInfo):
+                if not isinstance(info.shape, relax.ShapeExpr):
+                    return None
+                count = 1
+                for dim in info.shape.values:
+                    if not isinstance(dim, tir.IntImm) or dim.value < 0:
+                        return None
+                    count *= int(dim.value)
+                dtype = tvm.DataType(info.dtype)
+                if dtype.bits == 0:
+                    return None
+                payload[0] += count * ((dtype.bits * dtype.lanes + 7) // 8)
+                if payload[0] > 65536:
+                    return None
+            if isinstance(value, relax.Var):
+                bound = bb.lookup_binding(value)
+                result = None if bound is None else closed(bound, depth + 1)
+            elif isinstance(value, relax.Constant):
+                result = value
+            elif isinstance(value, relax.ShapeExpr):
+                result = value if all(isinstance(dim, tir.IntImm) for dim in value.values) else None
+            elif isinstance(value, relax.PrimValue):
+                result = value if isinstance(value.value, tir.IntImm) else None
+            elif isinstance(value, relax.Tuple):
+                fields = [closed(field, depth + 1) for field in value.fields]
+                result = None if any(field is None for field in fields) else relax.Tuple(fields)
+            elif isinstance(value, relax.Call) and isinstance(value.op, tvm.ir.Op) and value.op.name in allowed:
+                args = [closed(arg, depth + 1) for arg in value.args]
+                result = None if any(arg is None for arg in args) else relax.Call(
+                    value.op, args, value.attrs, value.sinfo_args, value.span)
+            else:
+                result = None
+            active.remove(value)
+            memo[value] = result
+            return result
+
+        expression = closed(shape)
+        if expression is None:
+            return None
+        # The original builder/producer graph is untouched. FoldConstant owns
+        # legalization and numerical evaluation of this isolated dataflow graph.
+        builder = relax.BlockBuilder()
+        with builder.function("main", []):
+            with builder.dataflow():
+                output = builder.emit_output(expression)
+            builder.emit_func_output(output)
+        try:
+            folded = relax.transform.FoldConstant()(builder.get())["main"].body
+        except TVMError:
+            return None
+        if isinstance(folded, relax.SeqExpr):
+            folded = folded.body
+        return folded if isinstance(folded, relax.Constant) else None
+
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
         data = inputs[0]
         new_shape = get_constant(inputs[1], params)
+        if isinstance(new_shape.struct_info, relax.TensorStructInfo) and not isinstance(new_shape, relax.Constant):
+            new_shape = cls._fold_shape_input(bb, new_shape)
+            if new_shape is None:
+                raise NotImplementedError("Reshape requires a constant or bounded closed shape calculation")
 
         if isinstance(data, relax.ShapeExpr) and isinstance(new_shape, relax.Constant):
             new_shape = constant_numpy(new_shape).tolist()
