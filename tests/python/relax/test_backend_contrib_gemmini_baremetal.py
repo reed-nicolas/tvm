@@ -213,6 +213,88 @@ class StaticGraphTests(unittest.TestCase):
             np.testing.assert_array_equal(outputs[0], (value.astype("int64") @ weights + 3) * 2 - 1)
             np.testing.assert_array_equal(inputs[0], value)
 
+    def test_bfloat16_fusion_preserves_intermediate_store_rounding(self):
+        import ml_dtypes
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+
+        values = np.array([1, 1.0078125, -1, -1.0078125], dtype=ml_dtypes.bfloat16)
+        delta = np.full((4,), 2. ** -8, dtype=ml_dtypes.bfloat16)
+        factor = np.full((4,), 1000, dtype=ml_dtypes.bfloat16)
+
+        def round_bf16(value):
+            words = np.asarray(value, dtype="float32").view("uint32")
+            bias = np.uint32(0x7fff) + ((words >> np.uint32(16)) & np.uint32(1))
+            return ((words + bias) >> np.uint32(16)).astype("uint16")
+
+        stored = round_bf16(values.astype("float32") + delta.astype("float32"))
+        decoded = (stored.astype("uint32") << np.uint32(16)).view("float32")
+        expected = round_bf16(decoded * factor.astype("float32"))
+        np.testing.assert_array_equal(expected, np.array([1000, 1016, -996, -1000], dtype=ml_dtypes.bfloat16).view("uint16"))
+        params = [relax.Var(name, relax.TensorStructInfo((4,), "bfloat16")) for name in ("x", "delta", "factor")]
+        builder = relax.BlockBuilder()
+        with builder.function("main", params):
+            with builder.dataflow():
+                intermediate = builder.emit(relax.op.add(params[0], params[1]))
+                result = builder.emit_output(relax.op.multiply(intermediate, params[2]))
+            builder.emit_func_output(result)
+        original = builder.get()
+        root = self.root
+        for optimized in (False, True):
+            with self.subTest(optimized=optimized):
+                self.root = root / ("optimized" if optimized else "baseline")
+                report, loaded, inputs, outputs, workspace = self.compile(prepare_gemmini_graph(original, optimize=optimized))
+                self.assertEqual(report["outputs"][0]["dtype"], "bfloat16")
+                self.assertEqual(len(report["calls"]), 1 if optimized else 2)
+                self.assertFalse(report["runtime_workspace_allocator_required"])
+                for reversed_input in (False, True, False):
+                    inputs[0][:] = values[::-1] if reversed_input else values
+                    inputs[1][:], inputs[2][:] = delta, factor
+                    before = [value.view("uint16").copy() for value in inputs]
+                    outputs[0].view("uint16").fill(0x5555)
+                    self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+                    np.testing.assert_array_equal(outputs[0].view("uint16"), expected[::-1] if reversed_input else expected)
+                    for value, saved in zip(inputs, before):
+                        np.testing.assert_array_equal(value.view("uint16"), saved)
+
+    def test_fp32_pointwise_inline_keeps_declared_precision(self):
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+
+        params = [relax.Var(name, relax.TensorStructInfo((4,), "float32")) for name in ("x", "delta", "factor")]
+        builder = relax.BlockBuilder()
+        with builder.function("main", params):
+            with builder.dataflow():
+                intermediate = builder.emit(relax.op.add(params[0], params[1]))
+                result = builder.emit_output(relax.op.multiply(intermediate, params[2]))
+            builder.emit_func_output(result)
+        mod = prepare_gemmini_graph(builder.get(), optimize=True)
+        report, loaded, inputs, outputs, workspace = self.compile(mod)
+        inputs[0][:] = [1, 1.0078125, -1, -1.0078125]
+        inputs[1].fill(2. ** -8)
+        inputs[2].fill(1000)
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+        np.testing.assert_array_equal(outputs[0], (inputs[0] + inputs[1]) * inputs[2])
+        self.assertEqual(len(report["calls"]), 1)
+        self.assertEqual(report["workspace_bytes"], 0)
+
+    def test_low_precision_scalar_and_vector_stores_survive_inline(self):
+        from tvm import te
+        from tvm.relax.backend.contrib.gemmini import _inline_cpu_producers
+
+        # Structural coverage only: the static exporter has no FP8 tensor ABI.
+        for scalar in ("bfloat16", "e4m3_float8", "e5m2_float8", "float32"):
+            for lanes in (1, 4):
+                dtype = scalar if lanes == 1 else scalar + "x" + str(lanes)
+                with self.subTest(dtype=dtype):
+                    x, delta, factor = [te.placeholder((4,), dtype=dtype, name=name) for name in ("x", "delta", "factor")]
+                    intermediate = te.compute((4,), lambda i: x[i] + delta[i], name="stored_add")
+                    result = te.compute((4,), lambda i: intermediate[i] * factor[i], name="multiply")
+                    primitive = te.create_prim_func([x, delta, factor, result])
+                    after = _inline_cpu_producers(tvm.IRModule({"main": primitive}))
+                    if scalar == "float32":
+                        self.assertEqual(len(after["main"].body.block.alloc_buffers), 0)
+                    else:
+                        tvm.ir.assert_structural_equal(after["main"], primitive)
+
     def test_retained_tuple_results_alias_copies_and_workspace_rejection(self):
         report, loaded, inputs, outputs, workspace = self.compile(graph(tuple_output=True))
         value = np.arange(6, dtype="int8").reshape(2, 3) - 3

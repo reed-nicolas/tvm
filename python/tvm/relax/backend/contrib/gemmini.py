@@ -26,6 +26,7 @@ from math import prod
 
 import tvm
 from tvm import relax, tir
+from tvm._ffi.runtime_ctypes import DataTypeCode
 from tvm.relax.expr_functor import PyExprMutator, mutator
 
 _SYMBOL = "tvm_gemmini_matmul_i8_i32"
@@ -276,7 +277,11 @@ def _inline_cpu_producers(mod):
 
         def find_producer(node):
             if isinstance(node, tir.Block) and node.init is None and isinstance(node.body, tir.BufferStore) and len(node.writes) == 1:
-                data = node.writes[0].buffer.data
+                buffer = node.writes[0].buffer
+                # Inlining would erase the logical low-precision storage rounding.
+                if tvm.DataType(buffer.dtype).type_code in (DataTypeCode.BFLOAT, DataTypeCode.E4M3Float, DataTypeCode.E5M2Float):
+                    return
+                data = buffer.data
                 if data in internal and data not in parameters and all(axis.iter_type == tir.IterVar.DataPar for axis in node.iter_vars):
                     candidates.append(node.name_hint)
 
