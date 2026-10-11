@@ -749,6 +749,137 @@ class GemminiScheduleTests(unittest.TestCase):
             builder.emit_func_output(output)
         self.assertIn("R.nonzero", builder.get().script())
 
+    def test_onnx_variadic_broadcast_constants_and_llvm_match_reference(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx import from_onnx
+        cases = [
+            ("float32", [np.array(2.), np.array([[1., 4., -2.], [3., -1., 5.]]), np.array([[[0., 1., 2.]], [[4., -3., 1.]]])]),
+            ("float16", [np.array([[2048., -2048.]]), np.array(1.), np.array([-2048., 2048.])]),
+            ("int32", [np.array([[2**30, -2**30]]), np.array(2), np.array([[[1, -1]], [[3, -3]]])]),
+        ]
+        for dtype, values in cases:
+            values = [value.astype(dtype) for value in values]
+            kind = onnx.helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+            shape = np.broadcast_shapes(*(value.shape for value in values))
+            for operation in (("Min", "Max") if dtype == "int32" else ("Min", "Max", "Mean", "Sum")):
+                # The installed Mean oracle uses += and cannot enlarge its
+                # first operand. Independent ONNX Expand nodes implement the
+                # specified multidirectional broadcast before that oracle.
+                expanded = ["ea", "eb", "ec"]
+                oracle_nodes = [onnx.helper.make_node("Expand", [name, "shape"], [out]) for name, out in zip(("a", "b", "c"), expanded)]
+                oracle_nodes.append(onnx.helper.make_node(operation, expanded, ["out"]))
+                infos = [onnx.helper.make_tensor_value_info(name, kind, value.shape) for name, value in zip(("a", "b", "c"), values)]
+                outputs = [onnx.helper.make_tensor_value_info("out", kind, shape)]
+                oracle = onnx.helper.make_model(onnx.helper.make_graph(oracle_nodes, "oracle", infos, outputs, [onnx.numpy_helper.from_array(np.array(shape, "int64"), "shape")]), opset_imports=[onnx.helper.make_opsetid("", 13)])
+                feed = dict(zip(("a", "b", "c"), values))
+                expected = ReferenceEvaluator(oracle).run(None, feed)[0]
+                for constants in (False, True):
+                    with self.subTest(dtype=dtype, operation=operation, constants=constants):
+                        graph = onnx.helper.make_graph([onnx.helper.make_node(operation, list(feed), ["out"])], "variadic", [] if constants else infos, outputs, [onnx.numpy_helper.from_array(value, name) for name, value in feed.items()] if constants else [])
+                        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+                        mod = from_onnx(model, keep_params_in_input=False)
+                        vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+                        actual = vm["main"](*([] if constants else [tvm.nd.array(value) for value in values])).numpy()
+                        self.assertEqual(actual.dtype, np.dtype(dtype))
+                        if operation == "Mean" and not constants:
+                            # Existing TIR constant division may become a
+                            # reciprocal multiply. This local arithmetic check
+                            # allows its observed final rounding, not a policy
+                            # quality or compiler-session threshold change.
+                            np.testing.assert_allclose(actual, expected, rtol=np.finfo(dtype).eps, atol=0)
+                        else:
+                            np.testing.assert_array_equal(actual, expected)
+
+    def test_onnx_variadic_min_max_nonfinite_and_zero_bits(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx import from_onnx
+        values = [np.array([-0., 0., np.nan, 1., np.inf, -np.inf], "float32"), np.array([0., -0., 2., np.nan, -np.inf, np.inf], "float32"), np.array([-0., 0., 3., 4., 5., -5.], "float32")]
+        for operation in ("Min", "Max"):
+            infos = [onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, [6]) for name in ("a", "b", "c")]
+            outputs = [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.FLOAT, [6])]
+            graph = onnx.helper.make_graph([onnx.helper.make_node(operation, ["a", "b", "c"], ["out"])], "nonfinite", infos, outputs)
+            model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+            expected = ReferenceEvaluator(model).run(None, dict(zip(("a", "b", "c"), values)))[0]
+            for constants in (False, True):
+                with self.subTest(operation=operation, constants=constants):
+                    if constants:
+                        model = onnx.helper.make_model(onnx.helper.make_graph(list(graph.node), "constants", [], outputs, [onnx.numpy_helper.from_array(value, name) for name, value in zip(("a", "b", "c"), values)]), opset_imports=[onnx.helper.make_opsetid("", 13)])
+                    mod = from_onnx(model, keep_params_in_input=False)
+                    vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+                    actual = vm["main"](*([] if constants else [tvm.nd.array(value) for value in values])).numpy()
+                    np.testing.assert_array_equal(actual, expected)
+                    np.testing.assert_array_equal(actual.view("uint32"), expected.view("uint32"))
+
+    def test_onnx_variadic_version_type_shape_refusals_and_unary_identity(self):
+        from tvm.relax.frontend.onnx.onnx_frontend import Min, Max, Mean, Sum
+        builder = relax.BlockBuilder()
+        x = relax.Var("x", relax.TensorStructInfo(dtype="float32", ndim=3))
+        for converter in (Min, Max, Mean, Sum):
+            for version in (1, 8, 13):
+                self.assertIs(converter.get_converter(version)(builder, [x], {}, [{}, {}]), x)
+            for version in (1, 6):
+                with self.assertRaisesRegex(ValueError, "equal shapes"):
+                    converter.get_converter(version)(builder, [relax.const(np.ones((2, 3), "float32")), relax.const(np.float32(1))], {}, [{}, {}])
+            with self.assertRaises(NotImplementedError):
+                converter.get_converter(6)(builder, [x, x], {}, [{}, {}])
+            for constants in (False, True):
+                values = [relax.const(np.ones(shape, "float32")) if constants else relax.Var(name, relax.TensorStructInfo(shape, "float32")) for name, shape in (("a", (2, 3)), ("b", (2, 2)))]
+                with self.assertRaises((ValueError, tvm.error.TVMError)):
+                    builder.normalize(converter.get_converter(13)(builder, values, {}, [{}, {}]))
+            with self.assertRaisesRegex(ValueError, "identical dtype"):
+                converter.get_converter(13)(builder, [relax.const(np.float32(1)), relax.const(np.float16(2))], {}, [{}, {}])
+            integer = [relax.const(np.array([1, 3], "int32")), relax.const(np.int32(2))]
+            if converter in (Min, Max):
+                with self.assertRaises(ValueError):
+                    converter.get_converter(8)(builder, integer, {}, [{}, {}])
+                with self.assertRaises(ValueError):
+                    converter.get_converter(8)(builder, integer[:1], {}, [{}, {}])
+                result = converter.get_converter(12)(builder, integer, {}, [{}, {}])
+                self.assertEqual(result.struct_info.dtype, "int32")
+                np.testing.assert_array_equal(result.data.numpy(), [1, 2] if converter is Min else [2, 3])
+            else:
+                with self.assertRaises(ValueError):
+                    converter.get_converter(13)(builder, integer, {}, [{}, {}])
+                with self.assertRaises(ValueError):
+                    converter.get_converter(13)(builder, integer[:1], {}, [{}, {}])
+
+    def test_onnx_variadic_bf16_arithmetic_boundaries_and_symbolic_shapes(self):
+        import ml_dtypes
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx.onnx_frontend import Min, Max, Mean, Sum, constant_numpy
+        # 256 + 1 rounds to 256 in BF16; adding -256 next must give zero,
+        # whereas a promoted whole reduction would give one.
+        values = [np.array([256., -256.], dtype=ml_dtypes.bfloat16), np.array(1., dtype=ml_dtypes.bfloat16), np.array([-256., 256.], dtype=ml_dtypes.bfloat16)]
+        constants = [relax.const(value, "bfloat16") for value in values]
+        for converter in (Mean, Sum):
+            with self.assertRaises(ValueError):
+                converter.get_converter(8)(relax.BlockBuilder(), constants, {}, [{}, {}])
+            names = ["a", "b", "c"]
+            infos = [onnx.helper.make_tensor_value_info(name, onnx.TensorProto.BFLOAT16, [2]) for name in names]
+            oracle = onnx.helper.make_model(onnx.helper.make_graph([onnx.helper.make_node(converter.__name__, names, ["out"])], "bf16", infos, [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.BFLOAT16, [2])]), opset_imports=[onnx.helper.make_opsetid("", 13)])
+            expected = ReferenceEvaluator(oracle).run(None, {name: np.broadcast_to(value, [2]).copy() for name, value in zip(names, values)})[0]
+            result = converter.get_converter(13)(relax.BlockBuilder(), constants, {}, [{}, {}])
+            self.assertEqual(result.struct_info.dtype, "bfloat16")
+            np.testing.assert_array_equal(constant_numpy(result).view("uint16"), expected.view("uint16"))
+            builder = relax.BlockBuilder()
+            inputs = [relax.Var(name, relax.TensorStructInfo(value.shape, "bfloat16")) for name, value in zip(("a", "b", "c"), values)]
+            with builder.function("main", inputs):
+                builder.emit_func_output(converter.get_converter(13)(builder, inputs, {}, [{}, {}]))
+            vm = relax.VirtualMachine(relax.build(builder.get(), "llvm"), tvm.cpu())
+            actual = vm["main"](*(value.data for value in constants)).numpy()
+            np.testing.assert_array_equal(actual, expected.view("uint16"))
+        n = tir.Var("n", "int64")
+        for converter in (Min, Max, Mean, Sum):
+            builder = relax.BlockBuilder()
+            x = relax.Var("x", relax.TensorStructInfo([n, 3], "float32"))
+            with builder.function("main", [x]):
+                builder.emit_func_output(converter.get_converter(13)(builder, [x, relax.const(np.float32(1))], {}, [{}, {}]))
+            self.assertTrue(relax.analysis.well_formed(builder.get()))
+            tvm.ir.assert_structural_equal(builder.get()["main"].ret_struct_info, x.struct_info)
+
     def test_onnx_round_ties_even_and_signed_zero(self):
         import onnx
         from tvm.relax.frontend.onnx import from_onnx

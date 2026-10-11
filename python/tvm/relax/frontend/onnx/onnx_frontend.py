@@ -2000,56 +2000,112 @@ class Sqrt(OnnxOpConverter):
 
 
 class MultiInputBase(OnnxOpConverter):
-    """Converts an onnx MultiInputBase node into an equivalent Relax expression."""
+    """Ordered variadic elementwise operations, with opset-specific broadcasting."""
 
     numpy_op: Callable = None
     relax_op: Callable = None
+    integer_types = False
+
+    @classmethod
+    def _convert(cls, bb, inputs, broadcast, integers=False, bf16=False):
+        if not inputs:
+            raise ValueError("Variadic elementwise operations require at least one input")
+        dtype = inputs[0].struct_info.dtype
+        valid = {"float16", "float32", "float64"}
+        if integers:
+            valid.update({"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"})
+        if bf16:
+            valid.add("bfloat16")
+        if dtype not in valid or any(value.struct_info.dtype != dtype for value in inputs):
+            raise ValueError("Variadic elementwise inputs require one supported, identical dtype")
+        # Preserve the unary identity even when its extents are unknown.
+        if len(inputs) == 1:
+            return inputs[0]
+        if not broadcast:
+            shapes = [value.struct_info.shape for value in inputs]
+            if not all(isinstance(shape, relax.ShapeExpr) for shape in shapes):
+                raise NotImplementedError("Legacy variadic operations require provably equal shapes")
+            analyzer = tvm.arith.Analyzer()
+            if any(
+                len(shape) != len(shapes[0])
+                or any(not analyzer.can_prove(a == b) for a, b in zip(shape, shapes[0]))
+                for shape in shapes[1:]
+            ):
+                raise ValueError("Legacy variadic operations require equal shapes")
+        if all(isinstance(value, relax.Constant) for value in inputs):
+            arrays = [constant_numpy(value) for value in inputs]
+            result = arrays[0]
+            for value in arrays[1:]:
+                # Keep each arithmetic boundary in the ONNX declared dtype.
+                result = _np.asarray(cls.numpy_op(result, value), dtype=arrays[0].dtype)
+            if cls is Mean:
+                divisor = _np.asarray(len(inputs), dtype=result.dtype)
+                result = _np.asarray(result / divisor, dtype=result.dtype)
+            return relax.const(result, dtype)
+        result = inputs[0]
+        for value in inputs[1:]:
+            if cls in (Min, Max) and dtype in {"float16", "float32", "float64", "bfloat16"}:
+                # NumPy/ONNX minimum and maximum propagate NaNs and choose the
+                # second operand on equal values (including signed zero).
+                comparison = relax.op.less if cls is Min else relax.op.greater
+                ordered = bb.normalize(relax.op.where(comparison(result, value), result, value))
+                rhs_nan = bb.normalize(relax.op.where(bb.call_te(topi.isnan, value), value, ordered))
+                result = bb.normalize(relax.op.where(bb.call_te(topi.isnan, result), result, rhs_nan))
+            else:
+                result = bb.normalize(cls.relax_op(result, value))
+        if cls is Mean:
+            result = relax.op.divide(result, relax.const(len(inputs), dtype))
+        return result
 
     @classmethod
     def _impl_v1(cls, bb, inputs, attr, params):
-        if cls.numpy_op is None or cls.relax_op is None:
-            raise NotImplementedError("numpy_op and relax_op must be defined for MultiInputBase")
-        # A variadic elementwise reduction over one operand is an identity,
-        # including when that operand's extents are not statically known.
-        if len(inputs) == 1:
-            return inputs[0]
-        if all([isinstance(inp, relax.Constant) for inp in inputs]):
-            np_inputs = [constant_numpy(inp) for inp in inputs]
-            output = cls.numpy_op(*np_inputs)  # pylint: disable=not-callable
-            return relax.const(output, output.dtype)
+        return cls._convert(bb, inputs, broadcast=False)
 
-        # Expand inputs, stack them, then perform minimum over the new axis.
-        inputs = [bb.normalize(relax.op.expand_dims(i, axis=0)) for i in inputs]
-        stacked_tensor = relax.op.concat(inputs, axis=0)
-        return cls.relax_op(stacked_tensor, axis=0)  # pylint: disable=not-callable
+    @classmethod
+    def _impl_v8(cls, bb, inputs, attr, params):
+        return cls._convert(bb, inputs, broadcast=True)
+
+    @classmethod
+    def _impl_v13(cls, bb, inputs, attr, params):
+        return cls._convert(bb, inputs, broadcast=True, integers=cls.integer_types, bf16=True)
 
 
 class Min(MultiInputBase):
     """Converts an onnx Min node into an equivalent Relax expression."""
 
-    numpy_op = _np.min
-    relax_op = relax.op.min
+    numpy_op = _np.minimum
+    relax_op = relax.op.minimum
+    integer_types = True
+
+    @classmethod
+    def _impl_v12(cls, bb, inputs, attr, params):
+        return cls._convert(bb, inputs, broadcast=True, integers=True)
 
 
 class Max(MultiInputBase):
     """Converts an onnx Max node into an equivalent Relax expression."""
 
-    numpy_op = _np.max
-    relax_op = relax.op.max
+    numpy_op = _np.maximum
+    relax_op = relax.op.maximum
+    integer_types = True
+
+    @classmethod
+    def _impl_v12(cls, bb, inputs, attr, params):
+        return cls._convert(bb, inputs, broadcast=True, integers=True)
 
 
 class Mean(MultiInputBase):
     """Converts an onnx Mean node into an equivalent Relax expression."""
 
-    numpy_op = _np.mean
-    relax_op = relax.op.mean
+    numpy_op = _np.add
+    relax_op = relax.op.add
 
 
 class Sum(MultiInputBase):
     """Converts an onnx Sum node into an equivalent Relax expression."""
 
-    numpy_op = _np.sum
-    relax_op = relax.op.sum
+    numpy_op = _np.add
+    relax_op = relax.op.add
 
 
 class Log(OnnxOpConverter):
