@@ -937,8 +937,84 @@ class GatherND(OnnxOpConverter):
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
+        data, indices = inputs
         batch_dims = attr.get("batch_dims", 0)
-        return relax.op.gather_nd(inputs[0], inputs[1], batch_dims)
+        data_rank, indices_rank = data.struct_info.ndim, indices.struct_info.ndim
+        if data_rank < 0 or indices_rank < 0:
+            raise NotImplementedError("GatherND requires known input ranks")
+        if not 0 <= batch_dims < min(data_rank, indices_rank):
+            raise ValueError("GatherND batch_dims must be nonnegative and smaller than both ranks")
+        if str(indices.struct_info.dtype) != "int64":
+            raise ValueError("GatherND indices must have int64 dtype")
+
+        # Relax loses the last extent when expand_dims consumes a tensor with
+        # rank but no shape. Recover only extents proved by expression structure;
+        # no runtime index values or model-specific metadata are used.
+        budget = [128]
+
+        def last_extent(value, ancestors=(), depth=0):
+            if depth >= 32 or budget[0] <= 0 or any(value.same_as(v) for v in ancestors):
+                return None
+            budget[0] -= 1
+            ancestors = ancestors + (value,)
+            info = value.struct_info
+            if not isinstance(info, relax.TensorStructInfo) or info.ndim < 1:
+                return None
+            if isinstance(info.shape, relax.ShapeExpr):
+                last = info.shape.values[-1]
+                if isinstance(last, tvm.tir.IntImm):
+                    return int(last.value)
+            if isinstance(value, relax.Var):
+                bound = bb.lookup_binding(value)
+                return None if bound is None else last_extent(bound, ancestors, depth + 1)
+            if not isinstance(value, relax.Call):
+                return None
+            if value.op == tvm.ir.Op.get("relax.expand_dims"):
+                axes = [int(axis) for axis in value.attrs.axis]
+                rank = info.ndim
+                if any(axis < -rank or axis >= rank for axis in axes):
+                    return None
+                axes = [axis % rank for axis in axes]
+                if len(set(axes)) != len(axes):
+                    return None
+                return 1 if rank - 1 in axes else last_extent(value.args[0], ancestors, depth + 1)
+            if value.op == tvm.ir.Op.get("relax.concat"):
+                axis, rank = int(value.attrs.axis), info.ndim
+                if not -rank <= axis < rank:
+                    return None
+                fields = value.args[0]
+                if not isinstance(fields, relax.Tuple) or not fields.fields:
+                    return None
+                if any(field.struct_info.ndim != rank for field in fields.fields):
+                    return None
+                extents = [last_extent(field, ancestors, depth + 1) for field in fields.fields]
+                if any(extent is None for extent in extents):
+                    return None
+                if axis % rank == rank - 1:
+                    return sum(extents)
+                return extents[0] if all(extent == extents[0] for extent in extents) else None
+            return None
+
+        width = last_extent(indices)
+        if width is None:
+            raise NotImplementedError("GatherND requires a provable last indices dimension")
+        if not 1 <= width <= data_rank - batch_dims:
+            raise ValueError("GatherND last indices dimension must be in [1, data rank - batch_dims]")
+        # ONNX requires matching batch extents. Reject statically disproved
+        # matches; unknown extents remain subject to the operator's input domain.
+        data_shape, indices_shape = data.struct_info.shape, indices.struct_info.shape
+        if isinstance(data_shape, relax.ShapeExpr) and isinstance(indices_shape, relax.ShapeExpr):
+            analyzer = tvm.arith.Analyzer()
+            for left, right in zip(data_shape.values[:batch_dims], indices_shape.values[:batch_dims]):
+                if analyzer.can_prove(left != right):
+                    raise ValueError("GatherND batch dimensions must match")
+        output = bb.normalize(relax.op.gather_nd(data, indices, batch_dims))
+        if output.struct_info.ndim >= 0:
+            return output
+        # q + r - K - 1 - batch_dims is an ONNX rank identity. MatchCast
+        # refines structural information only; it does not cast tensor values.
+        rank = indices_rank + data_rank - width - 1 - batch_dims
+        return bb.match_cast(output, relax.TensorStructInfo(dtype=data.struct_info.dtype, ndim=rank))
 
 
 class Scatter(OnnxOpConverter):
@@ -1189,6 +1265,21 @@ class Shape(OnnxOpConverter):
             return data_shape
 
         return data_info.shape
+
+    @classmethod
+    def _impl_v15(cls, bb, inputs, attr, params):
+        shape = cls._impl_v13(bb, inputs, attr, params)
+        if "start" not in attr and "end" not in attr:
+            return shape
+        rank = shape.struct_info.ndim
+        if rank < 0:
+            raise NotImplementedError("Shape slicing requires a known rank")
+        start, end, _ = slice(attr.get("start", 0), attr.get("end", rank)).indices(rank)
+        if start == 0 and end == rank:
+            return shape
+        if shape.struct_info.values is None:
+            raise NotImplementedError("Shape slicing requires known shape values")
+        return relax.ShapeExpr(list(shape.struct_info.values)[start:end])
 
 
 class Trilu(OnnxOpConverter):
@@ -1829,6 +1920,10 @@ class MultiInputBase(OnnxOpConverter):
     def _impl_v1(cls, bb, inputs, attr, params):
         if cls.numpy_op is None or cls.relax_op is None:
             raise NotImplementedError("numpy_op and relax_op must be defined for MultiInputBase")
+        # A variadic elementwise reduction over one operand is an identity,
+        # including when that operand's extents are not statically known.
+        if len(inputs) == 1:
+            return inputs[0]
         if all([isinstance(inp, relax.Constant) for inp in inputs]):
             np_inputs = [constant_numpy(inp) for inp in inputs]
             output = cls.numpy_op(*np_inputs)  # pylint: disable=not-callable
@@ -2118,41 +2213,65 @@ class Expand(OnnxOpConverter):
     def _impl_v13(cls, bb, inputs, attr, params):
         data = inputs[0]
         shape = inputs[1]
-        if isinstance(shape, relax.ShapeExpr):
-            data_shape = list(data.struct_info.shape)
-            target_shape = list(shape.values)
-            data_shape = [1] * (len(target_shape) - len(data_shape)) + data_shape
-            assert len(data_shape) == len(target_shape)
-            # Fix small target shapes or target shapes assigned to -1
-            for i, s in enumerate(target_shape):
-                if isinstance(s, tvm.tir.IntImm) and (
-                    (isinstance(data_shape[i], tvm.tir.IntImm) and s < data_shape[i])
-                    or s.value == -1
-                ):
-                    target_shape[i] = data_shape[i]
-            if target_shape == data_shape:
-                return data
-            return relax.op.broadcast_to(data, relax.ShapeExpr(target_shape))
+        def binding(value):
+            seen = []
+            while isinstance(value, relax.Var) and len(seen) < 32:
+                if any(value.same_as(previous) for previous in seen):
+                    break
+                seen.append(value)
+                resolved = bb.lookup_binding(value)
+                if resolved is None:
+                    break
+                value = resolved
+            return value
 
-        # If possible, directly expand to constant shape.
-        if isinstance(shape, relax.Constant):
-            tgt = constant_numpy(shape).tolist()
-            data_shape = [dim.value for dim in data.struct_info.shape]
-            # ONNX Expand is TWO-WAY broadcasting: the output rank is max(data rank, target rank),
-            # so a *shorter* (lower-rank) target must NOT reduce the output rank — the leading data
-            # dims are kept. (A target of [] expanding a [1] tensor stays [1], not a rank-0 scalar,
-            # which would make broadcast_to fail "ndim 1 vs target ndim 0".) Right-align both and
-            # take the elementwise max (target -1 / 0 / smaller keeps the data dim).
-            rank = max(len(tgt), len(data_shape))
-            tgt_a = [1] * (rank - len(tgt)) + list(tgt)
-            data_a = [1] * (rank - len(data_shape)) + list(data_shape)
-            new_shape = []
-            for t, d in zip(tgt_a, data_a):
-                new_shape.append(d if (t == -1 or t < d) else t)
-            if new_shape == data_a:
-                return data if rank == len(data_shape) else relax.op.broadcast_to(
-                    data, relax.ShapeExpr(new_shape))
-            return relax.op.broadcast_to(data, relax.ShapeExpr(new_shape))
+        shape_value = binding(shape)
+        if (
+            isinstance(shape_value, relax.Call)
+            and shape_value.op == tvm.ir.Op.get("relax.shape_of")
+            and tvm.ir.structural_equal(binding(shape_value.args[0]), binding(data))
+        ):
+            # Full shape_of(x) needs no broadcast, even for unknown/zero extents.
+            # A sliced shape is not this expression and must take the paths below.
+            return data
+        target_shape = None
+        if isinstance(shape.struct_info, relax.ShapeStructInfo):
+            # Shape/shape_of may yield a Var or Call instead of a ShapeExpr.
+            # Such a value already has shape semantics, not a tensor .shape.
+            if shape.struct_info.values is None:
+                raise NotImplementedError("Expand requires known shape values; dynamic shape values are unsupported")
+            target_shape = list(shape.struct_info.values)
+        elif isinstance(shape, relax.Constant):
+            value = constant_numpy(shape)
+            if value.ndim != 1 or value.dtype != _np.dtype("int64"):
+                raise ValueError("Expand shape must be a one-dimensional int64 tensor")
+            target_shape = list(relax.ShapeExpr(value.tolist()).values)
+
+        if target_shape is not None:
+            if not isinstance(data.struct_info.shape, relax.ShapeExpr):
+                raise NotImplementedError("Expand requires a known input shape for static broadcasting")
+            data_shape = list(data.struct_info.shape.values)
+            # ONNX Expand uses two-way, right-aligned broadcasting. A shorter
+            # target retains leading input dimensions; zero is an extent, not 1.
+            rank = max(len(target_shape), len(data_shape))
+            one = tvm.tir.IntImm("int64", 1)
+            left = [one] * (rank - len(data_shape)) + data_shape
+            right = [one] * (rank - len(target_shape)) + target_shape
+            analyzer, output = tvm.arith.Analyzer(), []
+            for source, target in zip(left, right):
+                if any(isinstance(dim, tvm.tir.IntImm) and dim.value < 0 for dim in (source, target)):
+                    raise ValueError("Expand dimensions must be nonnegative")
+                if analyzer.can_prove(source == one):
+                    output.append(target)
+                elif analyzer.can_prove(target == one) or analyzer.can_prove(source == target):
+                    output.append(source)
+                elif isinstance(source, tvm.tir.IntImm) and isinstance(target, tvm.tir.IntImm):
+                    raise ValueError("Expand dimensions are not broadcast compatible")
+                else:
+                    raise NotImplementedError("Expand requires provably broadcast-compatible dimensions")
+            if len(output) == len(data_shape) and all(analyzer.can_prove(a == b) for a, b in zip(output, data_shape)):
+                return data
+            return relax.op.broadcast_to(data, relax.ShapeExpr(output))
 
         # Otherwise handle dynamic shapes.
         shape_ndim = [dim.value for dim in shape.struct_info.shape.values][0]

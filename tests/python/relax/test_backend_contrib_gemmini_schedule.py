@@ -389,6 +389,176 @@ class GemminiScheduleTests(unittest.TestCase):
             mod = builder.get()
             tvm.ir.assert_structural_equal(DecomposeGemminiLinear()(mod), mod)
 
+    def test_onnx_expand_known_shape_values_follow_broadcast_contract(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx.onnx_frontend import Expand
+        cases = (((3, 1), (2, 1, 6)), ((2, 3), (1,)), ((1,), ()),
+                 ((0, 3), (1, 3)), ((1,), (0,)))
+        for input_shape, target in cases:
+            for dtype, kind in (("int8", onnx.TensorProto.INT8), ("float32", onnx.TensorProto.FLOAT)):
+                with self.subTest(input_shape=input_shape, target=target, dtype=dtype):
+                    value = np.arange(np.prod(input_shape), dtype=dtype).reshape(input_shape)
+                    graph = onnx.helper.make_graph(
+                        [onnx.helper.make_node("Expand", ["x", "target"], ["out"])], "expand",
+                        [onnx.helper.make_tensor_value_info("x", kind, input_shape)],
+                        [onnx.helper.make_tensor_value_info("out", kind, None)],
+                        [onnx.numpy_helper.from_array(np.array(target, dtype="int64"), "target")])
+                    model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+                    expected = ReferenceEvaluator(model).run(None, {"x": value})[0]
+                    x = relax.Var("x", relax.TensorStructInfo(input_shape, dtype))
+                    builder = relax.BlockBuilder()
+                    with builder.function("main", [x]):
+                        with builder.dataflow():
+                            # A shape-valued Var carries known values, not a
+                            # TensorStructInfo.shape. No runtime tensor cast.
+                            shape = builder.emit(relax.ShapeExpr(target))
+                            output = builder.emit_output(Expand._impl_v13(builder, [x, shape], {}, [{}, {}]))
+                        builder.emit_func_output(output)
+                    vm = relax.VirtualMachine(relax.build(builder.get(), "llvm"), tvm.cpu())
+                    actual = vm["main"](tvm.nd.array(value)).numpy()
+                    self.assertEqual(actual.dtype, value.dtype)
+                    np.testing.assert_array_equal(actual, expected)
+        x = relax.Var("x", relax.TensorStructInfo((2, 3), "float32"))
+        for target in ((2, 2), (-1, 3)):
+            with self.assertRaises(ValueError):
+                Expand._impl_v13(relax.BlockBuilder(), [x, relax.ShapeExpr(target)], {}, [{}, {}])
+        with self.assertRaisesRegex(NotImplementedError, "dynamic shape values"):
+            Expand._impl_v13(relax.BlockBuilder(), [x, relax.Var("s", relax.ShapeStructInfo(ndim=2))], {}, [{}, {}])
+
+    def test_onnx_expand_full_shape_identity_unknown_extents_and_partial_refusal(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx import from_onnx
+        from tvm.relax.frontend.onnx.onnx_frontend import Expand, Shape
+        x = relax.Var("x", relax.TensorStructInfo(dtype="float32", ndim=2))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [x]):
+            shape = builder.emit(relax.op.shape_of(x))
+            output = Expand._impl_v13(builder, [x, shape], {}, [{}, {}])
+            self.assertTrue(output.same_as(x))
+            builder.emit_func_output(output)
+        unknown_vm = relax.VirtualMachine(relax.build(builder.get(), "llvm"), tvm.cpu())
+        with self.assertRaisesRegex(NotImplementedError, "Shape slicing requires known shape values"):
+            Shape._impl_v15(relax.BlockBuilder(), [x], {"start": 0, "end": 1}, [{}, {}])
+        nodes = [onnx.helper.make_node("Max", ["x"], ["same"]),
+                 onnx.helper.make_node("Shape", ["same"], ["shape"]),
+                 onnx.helper.make_node("Expand", ["x", "shape"], ["out"])]
+        graph = onnx.helper.make_graph(nodes, "identity",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [None, 3])],
+            [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.FLOAT, [None, 3])])
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 22)])
+        original = model.SerializeToString()
+        mod = from_onnx(model, keep_params_in_input=False)
+        self.assertEqual(model.SerializeToString(), original)
+        vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+        for dims in ((2, 3), (0, 3)):
+            value = np.arange(np.prod(dims), dtype="float32").reshape(dims)
+            expected = ReferenceEvaluator(model).run(None, {"x": value})[0]
+            np.testing.assert_array_equal(vm["main"](tvm.nd.array(value)).numpy(), expected)
+            np.testing.assert_array_equal(unknown_vm["main"](tvm.nd.array(value)).numpy(), expected)
+        # Partial Shape must not be mistaken for the full shape_of identity.
+        graph.node[1].attribute.extend([onnx.helper.make_attribute("start", 0),
+                                      onnx.helper.make_attribute("end", 1)])
+        partial = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 22)])
+        with self.assertRaisesRegex(NotImplementedError, "provably broadcast-compatible"):
+            from_onnx(partial, keep_params_in_input=False)
+        known = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 22)])
+        known.graph.input[0].CopyFrom(onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [2, 1]))
+        known.graph.output[0].CopyFrom(onnx.helper.make_tensor_value_info("out", onnx.TensorProto.FLOAT, [2, 2]))
+        mod = from_onnx(known, keep_params_in_input=False)
+        vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+        value = np.array([[3], [5]], dtype="float32")
+        expected = ReferenceEvaluator(known).run(None, {"x": value})[0]
+        self.assertEqual(expected.shape, (2, 2))
+        np.testing.assert_array_equal(vm["main"](tvm.nd.array(value)).numpy(), expected)
+
+    def test_onnx_gather_nd_rank_from_unknown_length_index_provenance(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx.onnx_frontend import GatherND
+
+        # Both index lengths are unknown: only Unsqueeze/Concat prove K=2.
+        data = relax.Var("data", relax.TensorStructInfo((2, 3), "float32"))
+        rows = relax.Var("rows", relax.TensorStructInfo(dtype="int64", ndim=1))
+        cols = relax.Var("cols", relax.TensorStructInfo(dtype="int64", ndim=1))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [data, rows, cols]):
+            with builder.dataflow():
+                left = builder.emit(relax.op.expand_dims(rows, -1))
+                right = builder.emit(relax.op.expand_dims(cols, 1))
+                indices = builder.emit(relax.op.concat([left, right], axis=-1))
+                self.assertIsNone(indices.struct_info.shape)
+                output = GatherND._impl_v13(builder, [data, indices], {}, [{}, {}])
+                self.assertEqual(output.struct_info.ndim, 1)
+                self.assertEqual(str(output.struct_info.dtype), "float32")
+                output = builder.emit_output(relax.op.permute_dims(output, [0]))
+            builder.emit_func_output(output)
+        script = builder.get().script()
+        self.assertIn("R.match_cast", script)
+        self.assertIn("R.gather_nd", script)
+        self.assertNotIn("R.astype", script)
+        graph = onnx.helper.make_graph([
+            onnx.helper.make_node("Unsqueeze", ["rows", "axes"], ["r"]),
+            onnx.helper.make_node("Unsqueeze", ["cols", "axes"], ["c"]),
+            onnx.helper.make_node("Concat", ["r", "c"], ["indices"], axis=-1),
+            onnx.helper.make_node("GatherND", ["data", "indices"], ["gathered"]),
+            onnx.helper.make_node("Transpose", ["gathered"], ["out"], perm=[0]),
+        ], "rank", [
+            onnx.helper.make_tensor_value_info("data", onnx.TensorProto.FLOAT, [2, 3]),
+            onnx.helper.make_tensor_value_info("rows", onnx.TensorProto.INT64, [None]),
+            onnx.helper.make_tensor_value_info("cols", onnx.TensorProto.INT64, [None]),
+        ], [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.FLOAT, [None])],
+            [onnx.numpy_helper.from_array(np.array([-1], dtype="int64"), "axes")])
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+        values = np.arange(6, dtype="float32").reshape(2, 3)
+        for row_values, col_values in (([0, 1, -1], [2, 0, -1]), ([], [])):
+            row_values, col_values = np.array(row_values, dtype="int64"), np.array(col_values, dtype="int64")
+            actual = ReferenceEvaluator(model).run(None, {"data": values, "rows": row_values, "cols": col_values})[0]
+            np.testing.assert_array_equal(actual, values[row_values, col_values])
+            self.assertEqual(actual.ndim, output.struct_info.ndim)
+
+    def test_onnx_gather_nd_static_values_batch_domain_and_dynamic_refusal(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx import from_onnx
+        from tvm.relax.frontend.onnx.onnx_frontend import GatherND
+        for shape, index_values, batch in (
+            ((2, 3), [[0, 2], [1, 0]], 0),
+            ((2, 3), [[0], [1]], 0),
+            ((2, 3, 4), [[[0], [2]], [[1], [0]]], 1),
+        ):
+            with self.subTest(shape=shape, batch=batch):
+                value = np.arange(np.prod(shape), dtype="float32").reshape(shape)
+                indices = np.array(index_values, dtype="int64")
+                graph = onnx.helper.make_graph(
+                    [onnx.helper.make_node("GatherND", ["x", "indices"], ["out"], batch_dims=batch)],
+                    "gather", [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+                    [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.FLOAT, None)],
+                    [onnx.numpy_helper.from_array(indices, "indices")])
+                model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+                source = model.SerializeToString()
+                expected = ReferenceEvaluator(model).run(None, {"x": value})[0]
+                mod = from_onnx(model, keep_params_in_input=False)
+                self.assertEqual(source, model.SerializeToString())
+                self.assertEqual(mod["main"].ret_struct_info.ndim, expected.ndim)
+                vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+                np.testing.assert_array_equal(vm["main"](tvm.nd.array(value)).numpy(), expected)
+        data = relax.Var("x", relax.TensorStructInfo((2, 3), "float32"))
+        for index_shape, batch in (((2, 0), 0), ((2, 3), 0), ((2, 1), -1), ((2, 1), 2)):
+            with self.assertRaises(ValueError):
+                indices = relax.Var("i", relax.TensorStructInfo(index_shape, "int64"))
+                GatherND._impl_v13(relax.BlockBuilder(), [data, indices], {"batch_dims": batch}, [{}, {}])
+        with self.assertRaisesRegex(ValueError, "batch dimensions must match"):
+            indices = relax.Var("i", relax.TensorStructInfo((3, 1, 1), "int64"))
+            GatherND._impl_v13(relax.BlockBuilder(), [data, indices], {"batch_dims": 1}, [{}, {}])
+        with self.assertRaisesRegex(NotImplementedError, "provable last indices dimension"):
+            indices = relax.Var("i", relax.TensorStructInfo(dtype="int64", ndim=2))
+            GatherND._impl_v13(relax.BlockBuilder(), [data, indices], {}, [{}, {}])
+        with self.assertRaisesRegex(NotImplementedError, "known input ranks"):
+            indices = relax.Var("i", relax.TensorStructInfo(dtype="int64"))
+            GatherND._impl_v13(relax.BlockBuilder(), [data, indices], {}, [{}, {}])
+
     def test_onnx_round_ties_even_and_signed_zero(self):
         import onnx
         from tvm.relax.frontend.onnx import from_onnx
