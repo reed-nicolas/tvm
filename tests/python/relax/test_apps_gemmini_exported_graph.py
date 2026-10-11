@@ -19,12 +19,14 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 import tvm
 
 sys.path.insert(0, str(Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"))
 from verify_exported_graph import load_fixture, validate_manifest
+from verify_baremetal_cpu import bind_cpu_runtime
 
 
 class FixtureAdmission(unittest.TestCase):
@@ -46,6 +48,51 @@ class FixtureAdmission(unittest.TestCase):
         for name, array in self.arrays.items():
             self.assertEqual(actual[name].dtype, array.dtype)
             self.assertEqual(actual[name].tobytes(), array.tobytes())
+
+    def test_bf16_raw_payload_and_float64_stream_preserve_exact_bits(self):
+        manifest = {"inputs": [{"shape": [2, 3], "dtype": "bfloat16", "bytes": 12}], "outputs": [{"shape": [2, 4], "dtype": "float64", "bytes": 64}]}
+        bits = np.array([0, 0x8000, 1, 0x8001, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x3f81, 0x3f7f, 0x4000, 0xc000], dtype=np.uint16).reshape(2, 2, 3)
+        values = np.arange(16, dtype=np.float64).reshape(2, 2, 4) + 2**-30
+        np.savez(self.path, input_0=bits, output_0=values)
+        actual, samples = load_fixture(self.path, manifest)
+        self.assertEqual(samples, 2)
+        self.assertEqual(actual["input_0"].tobytes(), bits.tobytes())
+        self.assertEqual(actual["output_0"].tobytes(), values.tobytes())
+        for replacement in (bits.astype(np.float32), bits.view(np.int16)):
+            np.savez(self.path, input_0=replacement, output_0=values)
+            with self.assertRaisesRegex(ValueError, "dtype/shape mismatch"):
+                load_fixture(self.path, manifest)
+        np.savez(self.path, input_0=bits, output_0=values.astype(np.float32))
+        with self.assertRaisesRegex(ValueError, "dtype/shape mismatch"):
+            load_fixture(self.path, manifest)
+
+    def test_nonfinite_bf16_and_float64_payloads_refused(self):
+        manifest = {"inputs": [{"shape": [1], "dtype": "bfloat16", "bytes": 2}], "outputs": [{"shape": [1], "dtype": "float64", "bytes": 8}]}
+        for bits in (0x7f80, 0xff80, 0x7f81, 0xffc1):
+            np.savez(self.path, input_0=np.array([[bits]], dtype=np.uint16), output_0=np.array([[0]], dtype=np.float64))
+            with self.subTest(bits=bits), self.assertRaisesRegex(ValueError, "finite"):
+                load_fixture(self.path, manifest)
+        for value in (np.nan, np.inf, -np.inf):
+            np.savez(self.path, input_0=np.array([[0]], dtype=np.uint16), output_0=np.array([[value]], dtype=np.float64))
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "finite"):
+                load_fixture(self.path, manifest)
+
+    def test_cpu_archives_are_explicit_distinct_and_self_contained(self):
+        bind, command = Mock(), Mock()
+        arguments, metadata = bind_cpu_runtime([], {}, bind, command)
+        self.assertEqual(arguments, [])
+        self.assertEqual(metadata["archives"], [])
+        bind.assert_not_called()
+        command.assert_not_called()
+        archive = Path(self.directory.name) / "runtime.a"
+        archive.write_bytes(b"!<thin>\n")
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            bind_cpu_runtime([archive, archive], {}, bind, command)
+        bind.assert_not_called()
+        bind.return_value = {"path": str(archive)}
+        with self.assertRaisesRegex(ValueError, "thin"):
+            bind_cpu_runtime([archive], {}, bind, command)
+        command.assert_not_called()
 
     def test_implicit_dtype_conversion_and_truncated_stream_refused(self):
         for name, replacement in (("input_0", self.arrays["input_0"].astype(np.float32)),

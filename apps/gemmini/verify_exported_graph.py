@@ -36,6 +36,9 @@ from verify_baremetal_cpu import STARTUP, LINKER, GUEST_BASE, GUEST_BYTES, STACK
 from verify_matmul import audit_instructions
 from verify_matmul_runtime import bind_runtime
 
+STORAGE_DTYPES = {name: np.dtype(name) for name in ("int8", "uint8", "int32", "int64", "float32", "float64", "bool")}
+STORAGE_DTYPES["bfloat16"] = np.dtype("uint16")
+
 
 RUNNER = r'''
 #include <stdint.h>
@@ -109,13 +112,12 @@ def aligned_size(size):
 
 def validate_tensor(tensor):
     """Refuse declared byte extents that could underallocate a typed buffer."""
-    dtypes = {"int8", "uint8", "int32", "int64", "float32", "bool"}
-    if not isinstance(tensor, dict) or type(tensor.get("dtype")) is not str or tensor["dtype"] not in dtypes:
+    if not isinstance(tensor, dict) or type(tensor.get("dtype")) is not str or tensor["dtype"] not in STORAGE_DTYPES:
         raise ValueError("Unsupported manifest tensor dtype")
     shape = tensor.get("shape")
     if not isinstance(shape, list) or any(type(dim) is not int or dim <= 0 for dim in shape):
         raise ValueError("Manifest tensor shape must contain positive static integers")
-    required = math.prod(shape) * np.dtype(tensor["dtype"]).itemsize
+    required = math.prod(shape) * STORAGE_DTYPES[tensor["dtype"]].itemsize
     if required > (1 << 63) - 1 or type(tensor.get("bytes")) is not int or tensor["bytes"] != required:
         raise ValueError("Manifest tensor bytes must equal dtype size times shape")
     return required
@@ -160,11 +162,12 @@ def load_fixture(path, manifest):
             for index, tensor in enumerate(manifest[kind + "s"]):
                 name = f"{kind}_{index}"
                 value = fixture[name]
-                if value.dtype != np.dtype(tensor["dtype"]) or value.ndim != len(tensor["shape"]) + 1 or tuple(value.shape[1:]) != tuple(tensor["shape"]) or value.shape[0] < 1:
+                if value.dtype != STORAGE_DTYPES[tensor["dtype"]] or value.ndim != len(tensor["shape"]) + 1 or tuple(value.shape[1:]) != tuple(tensor["shape"]) or value.shape[0] < 1:
                     raise ValueError(f"Fixture dtype/shape mismatch: {name}")
                 if count is None:
                     count = value.shape[0]
-                if value.shape[0] != count or (value.dtype.kind == "f" and not np.isfinite(value).all()):
+                nonfinite = np.any((value & np.uint16(0x7f80)) == np.uint16(0x7f80)) if tensor["dtype"] == "bfloat16" else value.dtype.kind == "f" and not np.isfinite(value).all()
+                if value.shape[0] != count or nonfinite:
                     raise ValueError("Fixture streams must have equal positive counts and finite values")
                 arrays[name] = np.ascontiguousarray(value)
     return arrays, count
