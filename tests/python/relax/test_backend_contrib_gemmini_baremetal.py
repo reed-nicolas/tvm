@@ -167,6 +167,37 @@ class StaticGraphTests(unittest.TestCase):
                 export_graphs(modules, output, target="llvm")
         self.assertFalse(output.exists())
 
+    def test_float64_and_bfloat16_storage_preserve_declared_arithmetic(self):
+        import ml_dtypes
+        report, loaded, inputs, outputs, workspace = self.compile(graph(dtype="float64"))
+        inputs[0][:] = np.arange(6).reshape(2, 3) / 4 + 2. ** -30
+        expected = (inputs[0] @ (np.arange(12).reshape(3, 4) - 5) + 3) * 2 - 1
+        self.assertTrue(np.any(expected != expected.astype("float32").astype("float64")))
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+        np.testing.assert_array_equal(outputs[0], expected)
+        self.root = self.root / "bf16"
+        self.root.mkdir()
+        x = relax.Var("x", relax.TensorStructInfo((8,), "bfloat16"))
+        values = np.array([-3.5, -0., 0., 0.5, 1., 1.0078125, 2., 127.], dtype=ml_dtypes.bfloat16)
+        constants = np.array([0., -0., 0., .001953125, .00390625, .00390625, .0078125, .25], dtype=ml_dtypes.bfloat16)
+        constant = tvm.nd.empty((8,), "bfloat16")
+        constant.copyfrom(constants.view("uint16"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [x]):
+            result = builder.emit(relax.op.add(relax.op.astype(x, "float32"), relax.op.astype(relax.Constant(constant), "float32")))
+            builder.emit_func_output(relax.op.astype(result, "bfloat16"))
+        mod = relax.transform.LegalizeOps()(builder.get())
+        report, loaded, inputs, outputs, workspace = self.compile(mod)
+        inputs[0][:] = values
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+        expected = (values.astype("float32") + constants.astype("float32")).astype(ml_dtypes.bfloat16)
+        np.testing.assert_array_equal(outputs[0].view("uint16"), expected.view("uint16"))
+        self.assertEqual(report["constants"][0]["bytes"], 16)
+        original = np.fromfile(self.root / "constants.bin", "uint16", count=8)
+        np.testing.assert_array_equal(original, constants.view("uint16"))
+        riscv = export_graph(mod, self.root / "riscv")
+        self.assertEqual(riscv["inputs"][0]["dtype"], "bfloat16")
+
     def test_mixed_dtype_calls_reuse_and_repeated_execution(self):
         report, loaded, inputs, outputs, workspace = self.compile(graph())
         self.assertEqual(len(report["calls"]), 4)
@@ -261,7 +292,7 @@ class StaticGraphTests(unittest.TestCase):
                 plan_graph(custom_graph(attribute=attribute))
 
     def test_unknown_shapes_dtypes_and_memory_are_rejected(self):
-        for mod in (graph(dtype="float64"), graph(shape=(tir.Var("batch", "int64"), 3))):
+        for mod in (graph(dtype="float16"), graph(shape=(tir.Var("batch", "int64"), 3))):
             with self.assertRaises(ValueError):
                 plan_graph(mod)
         with self.assertRaises(ValueError):

@@ -36,7 +36,7 @@ from tvm import relax, tir
 from verify_baremetal_cpu import checked_path
 
 ALIGNMENT = 64
-DTYPES = {"int8": "int8_t", "uint8": "uint8_t", "int32": "int32_t", "int64": "int64_t", "float32": "float", "bool": "uint8_t"}
+DTYPES = {"int8": "int8_t", "uint8": "uint8_t", "int32": "int32_t", "int64": "int64_t", "float32": "float", "float64": "double", "bfloat16": "uint16_t", "bool": "uint8_t"}
 RV64_TARGET = "llvm -mtriple=riscv64-unknown-elf -mcpu=generic-rv64 -mattr=+m,+a,+f,+d,+c -mabi=lp64d"
 
 
@@ -57,7 +57,7 @@ class Tensor:
 
     @property
     def nbytes(self):
-        return math.prod(self.shape) * np.dtype(self.dtype).itemsize
+        return math.prod(self.shape) * (2 if self.dtype == "bfloat16" else np.dtype(self.dtype).itemsize)
 
     def metadata(self):
         return {"name": self.name, "shape": list(self.shape), "dtype": self.dtype, "bytes": self.nbytes, "origin": self.origin, "offset": self.offset, "birth": self.birth, "last_use": self.last_use}
@@ -386,7 +386,9 @@ def _write_constants(constants, size, path):
     with path.open("wb") as stream:
         for tensor in constants:
             stream.seek(tensor.offset)
-            stream.write(tensor.value.astype(np.dtype(tensor.dtype).newbyteorder("<"), copy=False).tobytes())
+            # TVM exposes BF16 constants as raw uint16 payloads, not numeric uint16 values.
+            dtype = np.dtype("uint16" if tensor.dtype == "bfloat16" else tensor.dtype).newbyteorder("<")
+            stream.write(tensor.value.astype(dtype, copy=False).tobytes())
         stream.truncate(max(size, 1))
     include_path = str(path.absolute()).replace("\\", "\\\\").replace('"', '\\"')
     if any(character in include_path for character in ("\n", "\r")):
