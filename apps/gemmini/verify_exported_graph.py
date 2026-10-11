@@ -32,7 +32,7 @@ import traceback
 
 import numpy as np
 
-from verify_baremetal_cpu import STARTUP, LINKER, GUEST_BASE, GUEST_BYTES, STACK_BYTES, checked_path, identity
+from verify_baremetal_cpu import STARTUP, LINKER, GUEST_BASE, GUEST_BYTES, STACK_BYTES, checked_path, identity, bind_cpu_runtime, audit_cpu_runtime
 from verify_matmul import audit_instructions
 from verify_matmul_runtime import bind_runtime
 
@@ -228,6 +228,7 @@ def main():
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--cpu-runtime-library", action="append", type=Path, default=[], help="Explicit ordinary RV64/lp64d static archive; repeat for each CPU runtime dependency. No libraries are selected by default.")
     args = parser.parse_args()
     if args.repeats < 2 or not 1 <= args.timeout_seconds <= 86400:
         parser.error("repeats must be at least two; timeout must be in [1,86400]")
@@ -327,18 +328,23 @@ def main():
         for name in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIBRARY_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "LD_PRELOAD", "LD_AUDIT"):
             env.pop(name, None)
         env["PATH"] = str(gcc.parent) + ":/usr/bin:/bin"
+        runtime_arguments, runtime_binding = bind_cpu_runtime(args.cpu_runtime_library, tools, bind, command)
+        if runtime_arguments:
+            report["cpu_runtime"] = runtime_binding
         flags = ["-std=gnu11", "-march=rv64gc", "-mabi=lp64d", "-mcmodel=medany", "-msmall-data-limit=0", "-O2", "-ffreestanding", "-fno-builtin", "-fno-stack-protector", "-fno-tree-loop-distribute-patterns", "-nostdlib", "-nostartfiles", "-static", "-Wl,--no-relax", "-Wl,-T," + str(out / "link.ld"), "-I" + str(app), "-I" + str(out)]
         wrappers = ["-Wl,--wrap=tvm_gemmini_" + name for name in ("load_a", "load_b", "compute", "store", "validate_matmul_i8_i32")]
         programs = {}
         for name, wrong in (("valid", 0), ("bad-oracle", 1)):
             elf = out / (name + ".elf")
-            command([gcc, *flags, *wrappers, "-DBAD_ORACLE=" + str(wrong), "-Wl,-Map," + str(out / (name + ".map")), out / "start.S", out / "runner.c", out / "fixture.S", graph_dir / "model.c", graph_dir / "constants.S", graph_dir / "operators.o", adapter, "-o", elf], "link-" + name, env)
+            command([gcc, *flags, *wrappers, "-DBAD_ORACLE=" + str(wrong), "-Wl,-Map," + str(out / (name + ".map")), out / "start.S", out / "runner.c", out / "fixture.S", graph_dir / "model.c", graph_dir / "constants.S", graph_dir / "operators.o", adapter, *runtime_arguments, "-o", elf], "link-" + name, env)
             audit = audit_instructions(elf.read_bytes(), opcode, forbidden)
             if audit["prohibited_hits"]:
                 raise ValueError("FSM instructions in final executable")
             report["checks"].append({"name": name + "_no_fsm", "passed": True, **audit})
             if command([tools["nm"], "-u", elf], "undefined-" + name).strip():
                 raise ValueError("Unresolved runtime symbols in guest")
+            if runtime_arguments:
+                report["cpu_runtime"].setdefault("linked_images", {})[name] = audit_cpu_runtime(elf, out / (name + ".map"), runtime_binding, tools, command)
             programs[name] = elf
         headers = command([tools["readelf"], "-W", "-l", programs["valid"]], "program-headers")
         symbols_text = command([tools["nm"], "-S", "--defined-only", programs["valid"]], "symbols")

@@ -73,6 +73,105 @@ def identity(path):
             digest.update(chunk)
     return {"path": str(path), "sha256": digest.hexdigest(), "bytes": path.stat().st_size}
 
+
+def _rv64_double_abi(headers):
+    """Validate ELF headers, including every object reported for an archive."""
+    fields = {name: re.findall(r"^\s*" + name + r":\s*(.+)$", headers, re.MULTILINE)
+              for name in ("Class", "Data", "Machine", "Flags")}
+    count = len(fields["Class"])
+    if not count or any(len(values) != count for values in fields.values()):
+        raise ValueError("Runtime requires complete ELF headers")
+    if (any(value != "ELF64" for value in fields["Class"])
+            or any("little endian" not in value for value in fields["Data"])
+            or any(value != "RISC-V" for value in fields["Machine"])):
+        raise ValueError("Runtime requires little-endian ELF64 RISC-V objects")
+    flags = [int(value.split(",", 1)[0], 16) for value in fields["Flags"]]
+    if any(value & 6 != 4 or value & ~5 for value in flags):
+        raise ValueError("Runtime requires the RV64 double-float ABI without extra ELF flags")
+    return {"elf_objects": count, "class": "ELF64", "endianness": "little", "machine": "RISC-V", "abi": "lp64d"}
+
+
+def bind_cpu_runtime(libraries, tools, bind, command):
+    """Bind explicitly selected ordinary static archives; never discover libraries."""
+    selected = [checked_path(path) for path in libraries]
+    if len(set(selected)) != len(selected):
+        raise ValueError("CPU runtime archives must be distinct")
+    bindings = []
+    for index, path in enumerate(selected):
+        if path.suffix != ".a" or not path.is_file():
+            raise ValueError("CPU runtime requires explicit regular .a archive files")
+        binding = bind(path)
+        with path.open("rb") as stream:
+            if stream.read(8) != b"!<arch>\n":
+                raise ValueError("CPU runtime requires an ordinary archive; thin archives are not bound")
+        binding["elf_abi"] = _rv64_double_abi(command([tools["readelf"], "-h", path], f"cpu-runtime-{index}-headers"))
+        bindings.append(binding)
+    arguments = ["-Wl,--gc-sections", "-Wl,--start-group", *map(str, selected), "-Wl,--end-group"] if selected else []
+    return arguments, {"archives": bindings, "link_arguments": arguments, "requested_isa": "rv64gc", "abi": "lp64d",
+                       "scope": "Explicit static CPU runtime only; final linked image is audited for ISA, ABI, initialization and absence of heap/file callbacks"}
+
+
+def audit_cpu_runtime(elf, map_path, bindings, tools, command):
+    """Audit the final runtime closure, not discarded archive code."""
+    headers = command([tools["readelf"], "-h", "-A", elf], elf.stem + "-cpu-runtime-abi")
+    abi = _rv64_double_abi(headers)
+    attributes = re.findall(r'Tag_RISCV_arch:\s*"([^"]+)"', headers)
+    if len(attributes) != 1:
+        raise ValueError("CPU runtime requires one final RISC-V ISA attribute")
+    parts = attributes[0].split("_")
+    if not re.fullmatch(r"rv64i\d+p\d+", parts[0]):
+        raise ValueError("CPU runtime requires an RV64I base ISA")
+    extensions = set()
+    for part in parts[1:]:
+        match = re.fullmatch(r"([a-z]+)\d+p\d+", part)
+        if not match:
+            raise ValueError("Unknown CPU runtime ISA attribute")
+        extensions.add(match.group(1))
+    if not extensions <= {"m", "a", "f", "d", "c", "zicsr", "zifencei", "zmmul"}:
+        raise ValueError("CPU runtime ISA exceeds the selected RV64GC machine")
+    sections = command([tools["readelf"], "-W", "-S", elf], elf.stem + "-cpu-runtime-sections")
+    section_pattern = r"^\s*\[\s*\d+\]\s+(\S+)\s+(\S+)\s+[0-9a-f]+\s+[0-9a-f]+\s+([0-9a-f]+)\s+[0-9a-f]+\s*(.*?)\s+\d+\s+\d+\s+\d+\s*$"
+    parsed = [{"name": name, "type": kind, "bytes": int(size, 16), "flags": flags.strip()}
+              for name, kind, size, flags in re.findall(section_pattern, sections, re.MULTILINE)]
+    if not parsed:
+        raise ValueError("CPU runtime section audit is empty")
+    for section in parsed:
+        initializer = any(section["name"] == prefix or section["name"].startswith(prefix + ".")
+                          for prefix in (".init", ".fini", ".ctors", ".dtors"))
+        if section["bytes"] and ("T" in section["flags"] or initializer
+                or section["type"] in {"INIT_ARRAY", "PREINIT_ARRAY", "FINI_ARRAY"}):
+            raise ValueError("CPU runtime needs unsupported TLS or constructor initialization")
+    symbols = command([tools["nm"], "--defined-only", elf], elf.stem + "-cpu-runtime-symbols")
+    defined = {line.split()[-1] for line in symbols.splitlines() if len(line.split()) >= 3}
+    forbidden = {"malloc", "calloc", "realloc", "free", "aligned_alloc", "memalign", "_malloc_r", "_calloc_r", "_realloc_r", "_free_r",
+                 "_sbrk", "_sbrk_r", "sbrk", "_open", "_open_r", "_close", "_close_r", "_read", "_read_r", "_write", "_write_r",
+                 "_lseek", "_lseek_r", "_fstat", "_fstat_r", "_isatty", "_isatty_r", "open", "close", "read", "write", "lseek", "fstat", "isatty",
+                 "TVMBackendAllocWorkspace", "TVMBackendFreeWorkspace"}
+    if defined & forbidden:
+        raise ValueError("CPU runtime contains unsupported heap/file callbacks: " + ", ".join(sorted(defined & forbidden)))
+    text = checked_path(map_path).read_text()
+    if "Linker script and memory map" not in text:
+        raise ValueError("CPU runtime needs a complete linker map")
+    allocated = text.split("Linker script and memory map", 1)[1]
+    contribution = []
+    for binding in bindings["archives"]:
+        pattern = re.escape(binding["path"]) + r"\(([^()\r\n]+)\)"
+        extracted = sorted(set(re.findall(pattern, text.split("Discarded input sections", 1)[0])))
+        retained = []
+        for line in allocated.splitlines():
+            member = re.search(pattern, line)
+            extent = re.search(r"\b(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\b", line)
+            if member and extent:
+                address, size = (int(value, 16) for value in extent.groups())
+                if size and GUEST_BASE <= address < GUEST_BASE + GUEST_BYTES:
+                    retained.append({"member": member.group(1), "address": address, "bytes": size})
+        contribution.append({"archive": binding["path"], "extracted_members": extracted, "retained_allocated_extents": retained})
+    return {"final_elf_abi": abi, "final_isa_attribute": attributes[0], "final_sections": parsed,
+            "archive_contribution": contribution, "no_tls_or_constructors": True, "no_heap_or_file_callbacks": True,
+            "checked_forbidden_symbols": sorted(forbidden),
+            "initialization": "Single-hart loader initializes .data; startup clears .bss. No TLS, library constructor or heap initialization is supplied."}
+
+
 def export_static_probe(mod, out):
     func = mod['main']
     if not isinstance(func, relax.Function) or len(func.params) != 1:
