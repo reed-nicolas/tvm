@@ -399,7 +399,8 @@ class BinaryBase(OnnxOpConverter):
             output = cls.numpy_op(  # pylint: disable=not-callable
                 constant_numpy(inputs[0]), constant_numpy(inputs[1])
             )
-            return relax.const(output, inputs[0].struct_info.dtype)
+            dtype = "bool" if _np.asarray(output).dtype == _np.bool_ else inputs[0].struct_info.dtype
+            return relax.const(output, dtype)
         if any([isinstance(inp, relax.PrimValue) for inp in inputs]):
             x = _to_numpy(inputs[0])
             y = _to_numpy(inputs[1])

@@ -426,6 +426,30 @@ def test_compare(op_name: str):
     verify_compare(op_name, [1, 32])
 
 
+@pytest.mark.parametrize("op_name", ["Less", "LessOrEqual", "Greater", "GreaterOrEqual"])
+@pytest.mark.parametrize("dtype", ["int64", "float32"])
+def test_constant_comparison_keeps_boolean_condition(op_name, dtype):
+    lhs = np.array([[-2], [0], [2]], dtype=dtype)
+    rhs = np.array([[-2, -1, 0, 1, 2]], dtype=dtype)
+    input_value = np.arange(15, dtype=np.float32).reshape(3, 5)
+    graph = helper.make_graph(
+        [helper.make_node(op_name, ["lhs", "rhs"], ["mask"]), helper.make_node("Where", ["mask", "x", "zero"], ["selected"])],
+        "constant_comparison",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [3, 5])],
+        [helper.make_tensor_value_info("mask", TensorProto.BOOL, [3, 5]), helper.make_tensor_value_info("selected", TensorProto.FLOAT, [3, 5])],
+        initializer=[onnx.numpy_helper.from_array(value, name) for name, value in (("lhs", lhs), ("rhs", rhs), ("zero", np.array(0, dtype=np.float32)))],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    onnx.checker.check_model(model, full_check=True)
+    mod = from_onnx(model, keep_params_in_input=False)
+    assert mod["main"].ret_struct_info.fields[0].dtype == "bool"
+    vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+    mask, selected = vm["main"](tvm.nd.array(input_value))
+    expected = {"Less": np.less, "LessOrEqual": np.less_equal, "Greater": np.greater, "GreaterOrEqual": np.greater_equal}[op_name](lhs, rhs)
+    np.testing.assert_array_equal(mask.numpy(), expected)
+    np.testing.assert_array_equal(selected.numpy(), np.where(expected, input_value, np.float32(0)))
+
+
 @pytest.mark.parametrize("op_name", ["And", "Or", "Xor"])
 def test_binary_bool(op_name: str):
     verify_binary(op_name, [32, 32], [32, 32], [32, 32], dtype=TensorProto.BOOL)
