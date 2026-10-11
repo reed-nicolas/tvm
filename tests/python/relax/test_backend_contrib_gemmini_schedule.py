@@ -628,6 +628,127 @@ class GemminiScheduleTests(unittest.TestCase):
                 output = builder.emit_output(data)
             builder.emit_func_output(output)
 
+    def test_onnx_closed_nonzero_and_expand_prove_scatter_lengths(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx import from_onnx
+        initializers = [
+            onnx.numpy_helper.from_array(np.float32(1), "one"),
+            onnx.numpy_helper.from_array(np.float32(0), "zero"),
+            onnx.numpy_helper.from_array(np.array([1, 2, 2], dtype="int64"), "grid_shape"),
+            onnx.numpy_helper.from_array(np.array([4], dtype="int64"), "data_shape"),
+            onnx.numpy_helper.from_array(np.array([0], dtype="int64"), "axis"),
+            onnx.numpy_helper.from_array(np.array([-1], dtype="int64"), "vector_shape"),
+        ]
+        nodes = [
+            onnx.helper.make_node("Expand", ["one", "grid_shape"], ["ones"]),
+            onnx.helper.make_node("Cast", ["ones"], ["mask"], to=onnx.TensorProto.BOOL),
+            onnx.helper.make_node("Squeeze", ["mask", "axis"], ["grid"]),
+            onnx.helper.make_node("Reshape", ["grid", "vector_shape"], ["flat"]),
+            onnx.helper.make_node("NonZero", ["flat"], ["coordinates"]),
+            onnx.helper.make_node("Transpose", ["coordinates"], ["indices"], perm=[1, 0]),
+            onnx.helper.make_node("Cast", ["flat"], ["mask_i"], to=onnx.TensorProto.INT64),
+            onnx.helper.make_node("ReduceSum", ["mask_i"], ["target"], keepdims=1),
+            onnx.helper.make_node("Expand", ["x", "target"], ["updates"]),
+            onnx.helper.make_node("Expand", ["zero", "data_shape"], ["data"]),
+            onnx.helper.make_node("ScatterND", ["data", "indices", "updates"], ["out"]),
+        ]
+        graph = onnx.helper.make_graph(nodes, "closed-indexing",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [4])],
+            [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.FLOAT, [4])], initializers)
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 22)])
+        source = model.SerializeToString()
+        value = np.array([-2.5, 0, 1, 8.25], dtype="float32")
+        expected = ReferenceEvaluator(model).run(None, {"x": value})[0]
+        mod = from_onnx(model, keep_params_in_input=False)
+        self.assertEqual(model.SerializeToString(), source)
+        self.assertNotIn("R.nonzero", mod.script())
+        self.assertNotIn("R.match_cast", mod.script())
+        vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+        np.testing.assert_array_equal(vm["main"](tvm.nd.array(value)).numpy(), expected)
+
+    def test_onnx_constant_nonzero_order_empty_nonfinite_and_scalar_semantics(self):
+        import onnx
+        from onnx.reference import ReferenceEvaluator
+        from tvm.relax.frontend.onnx import from_onnx
+        from tvm.relax.frontend.onnx.onnx_frontend import NonZero, constant_numpy
+        cases = (
+            np.array([[0, 2, -3], [4, 0, -1]], dtype="int32"),
+            np.zeros((2, 3), dtype="float32"),
+            np.empty((2, 0, 3), dtype="bool"),
+            np.array([-0., 0., np.nan, np.inf, -np.inf, np.finfo("float32").tiny], dtype="float32"),
+            np.array(0, dtype="float32"), np.array(3, dtype="float32"),
+            np.array(np.nan, dtype="float32"),
+        )
+        for value in cases:
+            with self.subTest(shape=value.shape, dtype=value.dtype):
+                graph = onnx.helper.make_graph(
+                    [onnx.helper.make_node("NonZero", ["x"], ["out"])], "constant-nonzero", [],
+                    [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.INT64, None)],
+                    [onnx.numpy_helper.from_array(value, "x")])
+                model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+                source = model.SerializeToString()
+                if value.ndim:
+                    expected = ReferenceEvaluator(model).run(None, {})[0]
+                else:
+                    # ONNX specifies (0, N) for scalars. The installed reference
+                    # evaluator instead uses NumPy at-least-1D, returning (1, N).
+                    expected = np.empty((0, 0 if value.item() == 0 else 1), dtype="int64")
+                mod = from_onnx(model, keep_params_in_input=False)
+                self.assertEqual(model.SerializeToString(), source)
+                folded = NonZero._impl_v9(relax.BlockBuilder(), [relax.const(value)], {}, [{}, {}])
+                self.assertIsInstance(folded, relax.Constant)
+                self.assertEqual(str(folded.struct_info.dtype), "int64")
+                actual = constant_numpy(folded)
+                self.assertEqual(actual.shape, expected.shape)
+                np.testing.assert_array_equal(actual, expected)
+                if expected.size:
+                    vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+                    np.testing.assert_array_equal(vm["main"]().numpy(), expected)
+                # Empty coordinate payloads have correct importer semantics.
+                # This TVM's VM JIT constant loader rejects some zero-size
+                # constants; empty VM execution is separately unsupported.
+
+    def test_onnx_nonzero_unknown_and_budget_exhausted_masks_keep_dynamic_path(self):
+        from unittest.mock import patch
+        from tvm.relax.frontend.onnx.onnx_frontend import NonZero
+        unknown = relax.Var("mask", relax.TensorStructInfo((4,), "bool"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [unknown]):
+            with builder.dataflow():
+                with patch.object(np, "argwhere") as coordinates:
+                    output = NonZero._impl_v9(builder, [unknown], {}, [{}, {}])
+                    coordinates.assert_not_called()
+                output = builder.emit_output(output)
+            builder.emit_func_output(output)
+        self.assertIn("R.nonzero", builder.get().script())
+        # Even a small boolean input can produce more than 64 KiB of indices.
+        builder = relax.BlockBuilder()
+        with builder.function("main", []):
+            with builder.dataflow():
+                mask = relax.const(np.ones((8193,), dtype="bool"))
+                with patch.object(np, "argwhere") as coordinates, patch.object(relax.transform, "FoldConstant") as fold:
+                    output = NonZero._impl_v9(builder, [mask], {}, [{}, {}])
+                    coordinates.assert_not_called()
+                    fold.assert_not_called()
+                output = builder.emit_output(output)
+            builder.emit_func_output(output)
+        self.assertIn("R.nonzero", builder.get().script())
+        builder = relax.BlockBuilder()
+        with builder.function("main", []):
+            with builder.dataflow():
+                large = builder.emit(relax.op.broadcast_to(relax.const(np.int64(1)), [256, 128]))
+                scalar = builder.emit(relax.op.sum(large))
+                boolean = builder.emit(relax.op.astype(scalar, "bool"))
+                mask = builder.emit(relax.op.reshape(boolean, [1]))
+                with patch.object(np, "argwhere") as coordinates, patch.object(relax.transform, "FoldConstant") as fold:
+                    output = NonZero._impl_v9(builder, [mask], {}, [{}, {}])
+                    coordinates.assert_not_called()
+                    fold.assert_not_called()
+                output = builder.emit_output(output)
+            builder.emit_func_output(output)
+        self.assertIn("R.nonzero", builder.get().script())
+
     def test_onnx_round_ties_even_and_signed_zero(self):
         import onnx
         from tvm.relax.frontend.onnx import from_onnx

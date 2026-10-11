@@ -1188,26 +1188,22 @@ class Gemm(OnnxOpConverter):
         return Y
 
 
-class Reshape(OnnxOpConverter):
-    """Convert an onnx Reshape node into an equivalent Relax expression."""
+def _fold_bounded_closed_tensor(bb, value):
+    """Fold a bounded closed tensor used by a shape or indexing consumer."""
+    if not isinstance(value.struct_info, relax.TensorStructInfo):
+        return None
+    allowed = {"relax.astype", "relax.broadcast_to", "relax.strided_slice", "relax.squeeze",
+               "relax.take", "relax.sum", "relax.reshape", "relax.multiply", "relax.concat",
+               "relax.expand_dims"}
+    memo, active, payload = {}, set(), [0]
 
-    @staticmethod
-    def _fold_shape_input(bb, shape):
-        """Fold a bounded closed calculation used as a reshape shape."""
-        info = shape.struct_info
-        if not isinstance(info, relax.TensorStructInfo) or info.ndim != 1 or str(info.dtype) != "int64":
+    def closed(value, depth=0):
+        if value in memo:
+            return memo[value]
+        if depth >= 32 or value in active or len(memo) + len(active) >= 128:
             return None
-        allowed = {"relax.astype", "relax.broadcast_to", "relax.strided_slice", "relax.squeeze",
-                   "relax.take", "relax.sum", "relax.reshape", "relax.multiply", "relax.concat",
-                   "relax.expand_dims"}
-        memo, active, payload = {}, set(), [0]
-
-        def closed(value, depth=0):
-            if value in memo:
-                return memo[value]
-            if depth >= 32 or value in active or len(memo) + len(active) >= 128:
-                return None
-            active.add(value)
+        active.add(value)
+        try:
             info = value.struct_info
             if isinstance(info, relax.TensorStructInfo):
                 if not isinstance(info.shape, relax.ShapeExpr):
@@ -1241,27 +1237,40 @@ class Reshape(OnnxOpConverter):
                     value.op, args, value.attrs, value.sinfo_args, value.span)
             else:
                 result = None
-            active.remove(value)
             memo[value] = result
             return result
+        finally:
+            active.remove(value)
 
-        expression = closed(shape)
-        if expression is None:
+    expression = closed(value)
+    if expression is None:
+        return None
+    # The original builder/producer graph is untouched. FoldConstant owns
+    # legalization and numerical evaluation of this isolated dataflow graph.
+    builder = relax.BlockBuilder()
+    with builder.function("main", []):
+        with builder.dataflow():
+            output = builder.emit_output(expression)
+        builder.emit_func_output(output)
+    try:
+        folded = relax.transform.FoldConstant()(builder.get())["main"].body
+    except TVMError:
+        return None
+    if isinstance(folded, relax.SeqExpr):
+        folded = folded.body
+    return folded if isinstance(folded, relax.Constant) else None
+
+
+class Reshape(OnnxOpConverter):
+    """Convert an onnx Reshape node into an equivalent Relax expression."""
+
+    @staticmethod
+    def _fold_shape_input(bb, shape):
+        """Fold only one-dimensional int64 shape tensors."""
+        info = shape.struct_info
+        if not isinstance(info, relax.TensorStructInfo) or info.ndim != 1 or str(info.dtype) != "int64":
             return None
-        # The original builder/producer graph is untouched. FoldConstant owns
-        # legalization and numerical evaluation of this isolated dataflow graph.
-        builder = relax.BlockBuilder()
-        with builder.function("main", []):
-            with builder.dataflow():
-                output = builder.emit_output(expression)
-            builder.emit_func_output(output)
-        try:
-            folded = relax.transform.FoldConstant()(builder.get())["main"].body
-        except TVMError:
-            return None
-        if isinstance(folded, relax.SeqExpr):
-            folded = folded.body
-        return folded if isinstance(folded, relax.Constant) else None
+        return _fold_bounded_closed_tensor(bb, shape)
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
@@ -2314,6 +2323,10 @@ class Expand(OnnxOpConverter):
             # Full shape_of(x) needs no broadcast, even for unknown/zero extents.
             # A sliced shape is not this expression and must take the paths below.
             return data
+        if isinstance(shape.struct_info, relax.TensorStructInfo) and not isinstance(shape, relax.Constant):
+            folded = Reshape._fold_shape_input(bb, shape)
+            if folded is not None:
+                shape = folded
         target_shape = None
         if isinstance(shape.struct_info, relax.ShapeStructInfo):
             # Shape/shape_of may yield a Var or Call instead of a ShapeExpr.
@@ -3387,6 +3400,22 @@ class NonZero(OnnxOpConverter):
 
     @classmethod
     def _impl_v9(cls, bb, inputs, attr, params):
+        data = inputs[0]
+        info = data.struct_info
+        shape = info.shape
+        # Preflight the worst-case index output before folding its producer or
+        # allocating coordinates. Unknown inputs retain the dynamic path below.
+        if isinstance(shape, relax.ShapeExpr) and all(
+            isinstance(dim, tir.IntImm) and dim.value >= 0 for dim in shape.values
+        ):
+            count = math.prod(int(dim.value) for dim in shape.values)
+            if count * info.ndim * 8 <= 65536:
+                constant = _fold_bounded_closed_tensor(bb, data)
+                if constant is not None:
+                    # argwhere.T follows ONNX's row-major coordinate order and
+                    # scalar (0, N) output, including empty and nonfinite inputs.
+                    coordinates = _np.argwhere(constant_numpy(constant)).T.astype("int64", copy=False)
+                    return relax.const(coordinates, "int64")
         ndim = inputs[0].struct_info.ndim
         ndim = 1 if ndim == 0 else ndim
         nonzero_numbers = tir.Var("nonzero_numbers", "int64")
