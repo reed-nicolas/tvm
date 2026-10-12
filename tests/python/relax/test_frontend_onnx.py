@@ -3395,6 +3395,43 @@ def test_source_mean720_refuses_ambiguous_or_unsupported_contracts():
             from_onnx(model(**options))
 
 
+@pytest.mark.parametrize("kind,reduction,columns", [("QK", 64, 177), ("PV", 177, 64)])
+def test_source_sgemm177_static_interface_and_private_scratch(kind, reduction, columns):
+    shapes = [(1, 15, 50, reduction), (1, 15, reduction, columns)]
+    inputs = [helper.make_tensor_value_info(name, TensorProto.FLOAT, shape) for name, shape in zip(("a", "b"), shapes)]
+    output = helper.make_tensor_value_info("y", TensorProto.FLOAT, (1, 15, 50, columns))
+    node = helper.make_node(f"TorchMklSgemmF32{kind}177", ["a", "b"], ["y"], domain="merlin.source_preserving")
+    model = helper.make_model(helper.make_graph([node], "source_sgemm", inputs, [output]), opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    assert imported["main"].ret_struct_info.dtype == "float32"
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == (1, 15, 50, columns)
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_mkl_sgemm_") and isinstance(func, tvm.tir.PrimFunc))
+    assert int(prim.attrs["op_pattern"]) == 8
+    buffers = [prim.buffer_map[param] for param in prim.params]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(15 * 50 * reduction,), (15 * reduction * columns,), (15 * 50 * columns,), (1,)]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    assert '"llvm.fma"' in prim.script()
+    ordinary = helper.make_node("MatMul", ["a", "b"], ["y"])
+    original = from_onnx(helper.make_model(helper.make_graph([ordinary], "ordinary_matmul", inputs, [output]), opset_imports=[helper.make_opsetid("", 18)]))
+    assert not any(name.name_hint.startswith("torch_mkl_sgemm_") for name in original.functions)
+
+
+@pytest.mark.parametrize("kind,reduction,columns", [("QK", 64, 177), ("PV", 177, 64)])
+def test_source_sgemm177_refuses_unsupported_contracts(kind, reduction, columns):
+    def model(domain="merlin.source_preserving", versions=(1,), shape_a=None, shape_b=None, dtype=TensorProto.FLOAT, attributes=None, inputs=("a", "b"), outputs=("y",)):
+        shape_a = (1, 15, 50, reduction) if shape_a is None else shape_a
+        shape_b = (1, 15, reduction, columns) if shape_b is None else shape_b
+        node = helper.make_node(f"TorchMklSgemmF32{kind}177", inputs, outputs, domain=domain, **(attributes or {}))
+        infos = [helper.make_tensor_value_info(name, dtype, shape_a if name == "a" else shape_b) for name in inputs if name]
+        graph = helper.make_graph([node], "source_sgemm", infos, [helper.make_tensor_value_info(name, dtype, (1, 15, 50, columns)) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"algorithm": "other"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("a",)}, {"inputs": ("a", "")}, {"inputs": ("a", "b", "c")}, {"shape_a": (15, 50, reduction)}, {"shape_a": (1, 15, 49, reduction)}, {"shape_a": (1, 15, 50, reduction + 1)}, {"shape_a": (1, 15, 0, reduction)}, {"shape_a": (1, 15, "N", reduction)}, {"shape_a": ()}, {"shape_a": (1 << 61, 15, 50, reduction)}, {"shape_b": (1, 15, reduction, columns + 1)}, {"shape_b": (1, 14, reduction, columns)}, {"shape_b": (1, 15, "K", columns)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
 def test_source_softmax177_static_interface_and_private_scratch():
     """The custom contract exposes private storage while retaining one public output."""
     shape = (1, 15, 50, 177)
@@ -3463,6 +3500,42 @@ def test_source_layernorm768_refuses_ambiguous_geometry_or_epsilon():
         return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
 
     invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"axis": -1}}, {"attributes": {"epsilon": 1e-6}}, {"attributes": {"tvm_custom": "ignored"}}, {"inputs": ()}, {"inputs": ("x", "gamma", "beta")}, {"inputs": ("x", "gamma", "beta", "")}, {"inputs": ("x", "gamma", "beta", "epsilon", "x")}, {"outputs": ("y", "z")}, {"shape": (1024, 768)}, {"shape": (2, 1024, 768)}, {"shape": (1, 1023, 768)}, {"shape": (1, 1024, 767)}, {"shape": (1, 0, 768)}, {"shape": (1, "N", 768)}, {"shape": (1 << 61, 1024, 768)}, {"gamma_shape": (767,)}, {"gamma_shape": (1, 768)}, {"beta_shape": (767,)}, {"beta_shape": ("K",)}, {"dtype": TensorProto.FLOAT}, {"gamma_dtype": TensorProto.FLOAT}, {"beta_dtype": TensorProto.FLOAT}, {"dynamic_epsilon": True}, {"epsilon_shape": (1,)}, {"epsilon_dtype": np.float64}, *[{"epsilon_word": word} for word in (0, 0x358637bc, 0x358637be, 0xb58637bd, 0x7f800000, 0x7fc00000)]]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
+def test_source_conv3x16_static_interface_and_private_scratch():
+    shape = (1, 3, 512, 512)
+    output = (1, 768, 32, 32)
+    node = helper.make_node("TorchConv2dAvx512Bf16IC3Kernel16Stride16", ["x", "weight", "bias"], ["y"], domain="merlin.source_preserving")
+    inputs = [helper.make_tensor_value_info(name, TensorProto.BFLOAT16, dims) for name, dims in (("x", shape), ("weight", (768, 3, 16, 16)), ("bias", (768,)))]
+    model = helper.make_model(helper.make_graph([node], "source_conv3x16", inputs, [helper.make_tensor_value_info("y", TensorProto.BFLOAT16, output)]), opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    assert imported["main"].ret_struct_info.dtype == "bfloat16"
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == output
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_conv2d_avx512_") and isinstance(func, tvm.tir.PrimFunc))
+    assert int(prim.attrs["op_pattern"]) == 8
+    buffers = [prim.buffer_map[param] for param in prim.params]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [shape, (768, 3, 16, 16), (768,), output, (32,)]
+    assert [buffer.dtype for buffer in buffers] == ["bfloat16"] * 4 + ["float32"]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    assert prim.script().count('"llvm.fma"') == 4
+    ordinary = helper.make_node("Conv", ["x", "weight", "bias"], ["y"], strides=[16, 16], pads=[0, 0, 0, 0])
+    ordinary_inputs = [helper.make_tensor_value_info(name, TensorProto.FLOAT, dims) for name, dims in (("x", shape), ("weight", (768, 3, 16, 16)), ("bias", (768,)))]
+    original = from_onnx(helper.make_model(helper.make_graph([ordinary], "ordinary_conv", ordinary_inputs, [helper.make_tensor_value_info("y", TensorProto.FLOAT, output)]), opset_imports=[helper.make_opsetid("", 18)]))
+    assert not any(name.name_hint.startswith("torch_conv2d_avx512_") for name in original.functions)
+
+
+def test_source_conv3x16_refuses_ambiguous_geometry_or_schema():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 3, 512, 512), weight_shape=(768, 3, 16, 16), bias_shape=(768,), dtype=TensorProto.BFLOAT16, weight_dtype=TensorProto.BFLOAT16, bias_dtype=TensorProto.BFLOAT16, inputs=("x", "weight", "bias"), outputs=("y",), attributes=None):
+        node = helper.make_node("TorchConv2dAvx512Bf16IC3Kernel16Stride16", inputs, outputs, domain=domain, **(attributes or {}))
+        specs = {"x": (dtype, shape), "weight": (weight_dtype, weight_shape), "bias": (bias_dtype, bias_shape)}
+        graph_inputs = [helper.make_tensor_value_info(name, *specs[name]) for name in inputs if name]
+        graph = helper.make_graph([node], "source_conv3x16", graph_inputs, [helper.make_tensor_value_info(name, TensorProto.BFLOAT16, (1, 768, 32, 32)) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"strides": [16, 16]}}, {"attributes": {"pads": [0, 0, 0, 0]}}, {"attributes": {"group": 1}}, {"attributes": {"tvm_custom": "ignored"}}, {"inputs": ()}, {"inputs": ("x", "weight")}, {"inputs": ("x", "weight", "")}, {"inputs": ("x", "weight", "bias", "x")}, {"outputs": ("y", "z")}, {"shape": (2, 3, 512, 512)}, {"shape": (1, 4, 512, 512)}, {"shape": (1, 3, 256, 512)}, {"shape": (1, 3, "H", 512)}, {"shape": (1 << 61, 3, 512, 512)}, {"weight_shape": (767, 3, 16, 16)}, {"weight_shape": (768, 3, 15, 16)}, {"bias_shape": (1, 768)}, {"bias_shape": (767,)}, {"dtype": TensorProto.FLOAT}, {"weight_dtype": TensorProto.FLOAT}, {"bias_dtype": TensorProto.FLOAT}]
     for options in invalid:
         with pytest.raises(ValueError):
             from_onnx(model(**options))
