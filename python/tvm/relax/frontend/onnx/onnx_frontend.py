@@ -4012,6 +4012,245 @@ def source_mean720(A:T.Buffer((T.int64({rows}),T.int64(720)), 'float32'), Y:T.Bu
     return relax.op.reshape(result, shape[:-1] + (1,))
 
 
+def _source_layernorm768_call(bb, value, gamma, beta, epsilon):
+    """Pinned Torch AVX2 BF16 width768, source FMA/cascade order, CPU LLVM only.
+
+    PyTorch revision449b1768410104d3ed79d3bcfe4ba1d65c7f22c0,
+    moments_utils.h and layer_norm_kernel.cpp, BSD-3-Clause contributors.
+    Scalar source contraction and affine FMA sites are independently bound to
+    the installed native binary. Global CPU capability AVX512 does not identify
+    this kernel: its AVX512 registration is null and selected dispatch is AVX2.
+    Workload proof admits finite values and positive finite variance+epsilon.
+    Native-source/dispatch identity belongs to the model-aware exporter.
+    The private80-word output exposes320 scratch bytes to static planning.
+    """
+    from tvm.script import tir as T
+
+    for operand, wanted_shape in ((value, (1, 1024, 768)), (gamma, (768,)), (beta, (768,))):
+        info = getattr(operand, "struct_info", None)
+        if not isinstance(info, relax.TensorStructInfo) or info.dtype != "bfloat16" or not isinstance(info.shape, relax.ShapeExpr):
+            raise ValueError("Source LayerNorm768 requires static BF16 tensors")
+        shape = tuple(int(dim) for dim in info.shape.values if isinstance(dim, tir.IntImm))
+        if len(shape) != len(info.shape.values) or shape != wanted_shape:
+            raise ValueError("Source LayerNorm768 requires x[1,1024,768] and affine[768]")
+        if math.prod(shape) > ((1 << 63) - 1) // 2:
+            raise ValueError("Source LayerNorm768 BF16 storage exceeds byte span")
+    if not isinstance(epsilon, relax.Constant) or epsilon.struct_info.dtype != "float32" or epsilon.struct_info.ndim != 0:
+        raise ValueError("Source LayerNorm768 requires original constant FP32 scalar epsilon")
+    if int(constant_numpy(epsilon).view("uint32").item()) != 0x358637bd:
+        raise ValueError("Source LayerNorm768 requires original epsilon word0x358637bd")
+    source = """@T.prim_func
+ def source_layernorm768(X:T.Buffer((T.int64(1024),T.int64(768)), 'bfloat16'), G:T.Buffer((T.int64(768),), 'bfloat16'), B:T.Buffer((T.int64(768),), 'bfloat16'), E:T.Buffer((), 'float32'), Y:T.Buffer((T.int64(1024),T.int64(768)), 'bfloat16'), S:T.Buffer((T.int64(80),), 'float32')):
+  T.func_attr({'tir.noalias':True,'op_pattern':8})
+  with T.block('root'):
+   for row in range(T.int64(1024)):
+    for slot in range(T.int64(80)):
+     S[slot]=T.float32(0)
+    for chunk in range(T.int64(3)):
+     for slot in range(T.int64(32)):
+      S[T.int64(32)+slot]=T.float32(0)
+     for j in range(T.int64(16)):
+      S[71]=T.float32(1)/T.Cast('float32',j+T.int64(1))
+      for half,lane in T.grid(T.int64(2),T.int64(8)):
+       xv=T.reinterpret('float32',T.shift_left(T.Cast('uint32',T.reinterpret('uint16',X[row,chunk*T.int64(256)+j*T.int64(16)+half*T.int64(8)+lane])),T.uint32(16)))
+       S[72]=xv-S[T.int64(32)+half*T.int64(16)+lane]
+       S[T.int64(32)+half*T.int64(16)+lane]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),S[72],S[71],S[T.int64(32)+half*T.int64(16)+lane])
+       S[73]=xv-S[T.int64(32)+half*T.int64(16)+lane]
+       S[T.int64(40)+half*T.int64(16)+lane]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),S[72],S[73],S[T.int64(40)+half*T.int64(16)+lane])
+     for half in range(T.int64(2)):
+      oldcount=T.Select(chunk==T.int64(1),T.int64(32)+half*T.int64(16),half*T.int64(16))
+      S[71]=T.float32(16)/T.Cast('float32',oldcount+T.int64(16))
+      for lane in range(T.int64(8)):
+       S[72]=S[T.int64(32)+half*T.int64(16)+lane]-S[lane]
+       S[76]=S[T.int64(8)+lane]+S[T.int64(40)+half*T.int64(16)+lane]
+       S[74]=S[71]*S[72]
+       S[75]=S[72]*T.Cast('float32',oldcount)
+       S[lane]=S[lane]+S[74]
+       S[T.int64(8)+lane]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),S[75],S[74],S[76])
+     if chunk==T.int64(1):
+      S[71]=T.float32(64)/T.float32(64)
+      for lane in range(T.int64(8)):
+       S[72]=S[lane]-S[T.int64(16)+lane]
+       S[76]=S[T.int64(24)+lane]+S[T.int64(8)+lane]
+       S[74]=S[71]*S[72]
+       S[75]=S[72]*T.float32(0)
+       S[T.int64(16)+lane]=S[T.int64(16)+lane]+S[74]
+       S[T.int64(24)+lane]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),S[75],S[74],S[76])
+      for slot in range(T.int64(16)):
+       S[slot]=T.float32(0)
+    S[71]=T.float32(64)/T.float32(96)
+    for lane in range(T.int64(8)):
+     S[72]=S[T.int64(16)+lane]-S[lane]
+     S[76]=S[T.int64(8)+lane]+S[T.int64(24)+lane]
+     S[74]=S[71]*S[72]
+     S[75]=S[72]*T.float32(32)
+     S[lane]=S[lane]+S[74]
+     S[T.int64(8)+lane]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),S[75],S[74],S[76])
+    for lane in range(T.int64(8)):
+     S[71]=T.float32(96)/T.Cast('float32',(lane+T.int64(1))*T.int64(96))
+     S[72]=S[lane]-S[64]
+     S[64]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),S[71],S[72],S[64])
+     S[77]=S[72]*S[72]
+     S[78]=S[77]*S[71]
+     S[79]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),S[78],T.Cast('float32',lane*T.int64(96)),S[T.int64(8)+lane])
+     S[65]=S[65]+S[79]
+    S[66]=S[65]/T.float32(768)
+    S[67]=S[66]+E[()]
+    S[68]=T.call_llvm_pure_intrin('float32','llvm.sqrt',T.uint32(1),S[67])
+    S[69]=T.float32(1)/S[68]
+    S[70]=(-S[69])*S[64]
+    for col in range(T.int64(768)):
+     xv=T.reinterpret('float32',T.shift_left(T.Cast('uint32',T.reinterpret('uint16',X[row,col])),T.uint32(16)))
+     gv=T.reinterpret('float32',T.shift_left(T.Cast('uint32',T.reinterpret('uint16',G[col])),T.uint32(16)))
+     bv=T.reinterpret('float32',T.shift_left(T.Cast('uint32',T.reinterpret('uint16',B[col])),T.uint32(16)))
+     normalized=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),xv,S[69],S[70])
+     affine=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),normalized,gv,bv)
+     word=T.reinterpret('uint32',affine)
+     narrowed=T.Cast('uint16',T.shift_right(word+T.uint32(0x7fff)+T.bitwise_and(T.shift_right(word,T.uint32(16)),T.uint32(1)),T.uint32(16)))
+     Y[row,col]=T.reinterpret('bfloat16',narrowed)
+"""
+    # Remove one artificial indentation level used by this generated snippet.
+    source = "\n".join(line[1:] if line.startswith(" ") else line for line in source.splitlines())
+    prim = tvm.script.from_source(source, extra_vars={"T": T}).without_attr("global_symbol")
+    global_var = bb.add_func(prim, "torch_layernorm_avx2_bf16_width768_v1")
+    flat = bb.normalize(relax.op.reshape(value, (1024, 768)))
+    outputs = [relax.TensorStructInfo((1024, 768), "bfloat16"), relax.TensorStructInfo((80,), "float32")]
+    result = bb.normalize(relax.TupleGetItem(bb.emit(relax.call_tir(global_var, [flat, gamma, beta, epsilon], outputs)), 0))
+    return relax.op.reshape(result, (1, 1024, 768))
+
+
+class TorchLayerNormAvx2Bf16Width768(OnnxOpConverter):
+    """merlin.source_preserving v1: pinned BF16 LayerNorm768 source order."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        if len(inputs) != 4 or any(value is None for value in inputs):
+            raise ValueError("Source LayerNorm768 requires four operands")
+        return _source_layernorm768_call(bb, *inputs)
+
+
+def _source_softmax177_call(bb, value):
+    """Pinned SmolVLA FP32 last-axis softmax, including its one-word vector tail.
+
+    PyTorch 449b1768410104d3ed79d3bcfe4ba1d65c7f22c0 SoftMaxKernel.cpp
+    _vec_softmax_lastdim<float> and functional_base.h AVX512 reduce_all:
+    https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/SoftMaxKernel.cpp
+    PyTorch contributors, BSD-3-Clause (the license linked in _source_mean720_call).
+    SLEEF 3.8 xexpf uses the eight fused rounds and constants transcribed below;
+    the complete Boost license notice in _source_silu_call also applies here.
+    Source maximum, stored FP32 exponentials, sixteen-lane sums, reciprocal and
+    multiplication retain separate rounds. Only exp uses explicit llvm.fma.
+
+    Exporter/probe admission binds native dispatch/library/headers and finite
+    logits *and* finite shifted subtractions, with positive finite sums. These
+    are proof conditions, not exported runtime guards. This approximation is
+    source arithmetic, not a universally correctly rounded mathematical exp.
+    The explicit private 209-word output exposes 836 scratch bytes to planning.
+    """
+    from tvm.script import tir as T  # pylint: disable=import-outside-toplevel
+
+    info = getattr(value, "struct_info", None)
+    if not isinstance(info, relax.TensorStructInfo) or info.dtype != "float32" or not isinstance(info.shape, relax.ShapeExpr):
+        raise ValueError("Source softmax177 requires a static FP32 tensor")
+    shape = tuple(int(dim) for dim in info.shape.values if isinstance(dim, tir.IntImm))
+    if len(shape) != len(info.shape.values) or shape != (1, 15, 50, 177):
+        raise ValueError("Source softmax177 requires the bound SmolVLA shape [1,15,50,177]")
+    if math.prod(shape) > ((1 << 63) - 1) // 4:
+        raise ValueError("Source softmax177 FP32 storage exceeds the byte span")
+    source = """@T.prim_func
+def source_softmax177(A:T.Buffer((T.int64(750),T.int64(177)), 'float32'), Y:T.Buffer((T.int64(750),T.int64(177)), 'float32'), S:T.Buffer((T.int64(209),), 'float32')):
+    T.func_attr({'tir.noalias':True,'op_pattern':8})
+    with T.block('root'):
+        for r in range(T.int64(750)):
+            for l in range(T.int64(16)):
+                S[177+l]=A[r,l]
+            for g,l in T.grid(T.int64(10),T.int64(16)):
+                S[177+l]=T.max(S[177+l],A[r,(g+1)*16+l])
+            S[177]=T.max(S[177],A[r,176])
+            for l in range(T.int64(16)):
+                S[193+l]=T.max(S[177+l],S[177+T.bitwise_xor(l,T.int64(8))])
+            for l in range(T.int64(16)):
+                S[177+l]=S[193+l]
+            for l in range(T.int64(16)):
+                S[193+l]=T.max(S[177+l],S[177+T.bitwise_xor(l,T.int64(4))])
+            for l in range(T.int64(16)):
+                S[177+l]=S[193+l]
+            for l in range(T.int64(16)):
+                S[193+l]=T.max(S[177+l],S[177+T.bitwise_xor(l,T.int64(2))])
+            for l in range(T.int64(16)):
+                S[177+l]=S[193+l]
+            for l in range(T.int64(16)):
+                S[193+l]=T.max(S[177+l],S[177+T.bitwise_xor(l,T.int64(1))])
+            for l in range(T.int64(16)):
+                S[177+l]=S[193+l]
+            maximum=S[177]
+            for i in range(T.int64(177)):
+                d=A[r,i]-maximum
+                core=T.max(d,T.float32(-104))
+                multiplied=core*T.reinterpret('float32',T.uint32(0x3fb8aa3b))
+                lower=T.floor(multiplied)
+                fraction=multiplied-lower
+                base=T.Cast('int32',lower)
+                q=base+T.Select((fraction>T.float32(.5))|((fraction==T.float32(.5))&(T.bitwise_and(base,1)!=0)),1,0)
+                qf=T.Cast('float32',q)
+                s0=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),qf,T.reinterpret('float32',T.uint32(0xbf317200)),core)
+                s=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),qf,T.reinterpret('float32',T.uint32(0xb5bfbe8e)),s0)
+                u0=T.reinterpret('float32',T.uint32(0x39502bda))
+                u1=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),u0,s,T.reinterpret('float32',T.uint32(0x3ab696c9)))
+                u2=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),u1,s,T.reinterpret('float32',T.uint32(0x3c0888a6)))
+                u3=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),u2,s,T.reinterpret('float32',T.uint32(0x3d2aaa7a)))
+                u4=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),u3,s,T.reinterpret('float32',T.uint32(0x3e2aaaab)))
+                u5=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),u4,s,T.float32(.5))
+                square=s*s
+                polynomial=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),square,u5,s)
+                unit=T.float32(1)+polynomial
+                half=T.shift_right(q,1)
+                first=unit*T.reinterpret('float32',T.shift_left(half+127,23))
+                scaled=first*T.reinterpret('float32',T.shift_left(q-half+127,23))
+                S[i]=T.Select(d<T.float32(-104),T.float32(0),scaled)
+            for l in range(T.int64(16)):
+                S[177+l]=S[l]
+            for g,l in T.grid(T.int64(10),T.int64(16)):
+                S[177+l]=S[177+l]+S[(g+1)*16+l]
+            S[177]=S[177]+S[176]
+            for l in range(T.int64(16)):
+                S[193+l]=S[177+l]+S[177+T.bitwise_xor(l,T.int64(8))]
+            for l in range(T.int64(16)):
+                S[177+l]=S[193+l]
+            for l in range(T.int64(16)):
+                S[193+l]=S[177+l]+S[177+T.bitwise_xor(l,T.int64(4))]
+            for l in range(T.int64(16)):
+                S[177+l]=S[193+l]
+            for l in range(T.int64(16)):
+                S[193+l]=S[177+l]+S[177+T.bitwise_xor(l,T.int64(2))]
+            for l in range(T.int64(16)):
+                S[177+l]=S[193+l]
+            for l in range(T.int64(16)):
+                S[193+l]=S[177+l]+S[177+T.bitwise_xor(l,T.int64(1))]
+            for l in range(T.int64(16)):
+                S[177+l]=S[193+l]
+            reciprocal=T.float32(1)/S[177]
+            for i in range(T.int64(177)):
+                Y[r,i]=S[i]*reciprocal
+"""
+    prim = tvm.script.from_source(source, extra_vars={"T": T}).without_attr("global_symbol")
+    global_var = bb.add_func(prim, "torch_softmax_avx512_fp32_lastdim177_v1")
+    flat = bb.normalize(relax.op.reshape(value, (750, 177)))
+    outputs = [relax.TensorStructInfo((750, 177), "float32"), relax.TensorStructInfo((209,), "float32")]
+    result = bb.normalize(relax.TupleGetItem(bb.emit(relax.call_tir(global_var, [flat], outputs)), 0))
+    return relax.op.reshape(result, shape)
+
+
+class TorchSoftmaxAvx512F32LastDim177(OnnxOpConverter):
+    """merlin.source_preserving v1: bound SmolVLA CPU FLOAT softmax arithmetic."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        if len(inputs) != 1 or inputs[0] is None:
+            raise ValueError("Source softmax177 requires one tensor operand")
+        return _source_softmax177_call(bb, inputs[0])
+
+
 class TorchMean720Fp32(OnnxOpConverter):
     """merlin.source_preserving v1: FP32 eight-lane cascade mean, last-axis keepdim."""
 
@@ -4036,6 +4275,8 @@ def _get_convert_map():
     return {
         "TorchSiluAvx512F32": TorchSiluAvx512F32,
         "TorchMean720Fp32": TorchMean720Fp32,
+        "TorchSoftmaxAvx512F32LastDim177": TorchSoftmaxAvx512F32LastDim177,
+        "TorchLayerNormAvx2Bf16Width768": TorchLayerNormAvx2Bf16Width768,
         "FixedTreeDot": FixedTreeDot,
         "FixedTreeMeanSquares": FixedTreeMeanSquares,
         # defs/experimental
@@ -4399,8 +4640,8 @@ class ONNXGraphImporter:
                     raise ValueError("Fixed-tree operators require exactly one merlin.fixed_order version 1 import")
                 if node.attribute or len(node.output) != 1:
                     raise ValueError("Fixed-tree operators require no attributes and one output")
-            if op_name in ("TorchSiluAvx512F32", "TorchMean720Fp32") or node.domain == "merlin.source_preserving":
-                if node.domain != "merlin.source_preserving" or self._source_preserving_opsets != [1] or op_name not in ("TorchSiluAvx512F32", "TorchMean720Fp32"):
+            if op_name in ("TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchLayerNormAvx2Bf16Width768") or node.domain == "merlin.source_preserving":
+                if node.domain != "merlin.source_preserving" or self._source_preserving_opsets != [1] or op_name not in ("TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchLayerNormAvx2Bf16Width768"):
                     raise ValueError("Source operators require exactly one merlin.source_preserving version 1 import")
                 if node.attribute or len(node.output) != 1:
                     raise ValueError("Source operators require no attributes and one output")

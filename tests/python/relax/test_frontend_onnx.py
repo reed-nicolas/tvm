@@ -3395,5 +3395,78 @@ def test_source_mean720_refuses_ambiguous_or_unsupported_contracts():
             from_onnx(model(**options))
 
 
+def test_source_softmax177_static_interface_and_private_scratch():
+    """The custom contract exposes private storage while retaining one public output."""
+    shape = (1, 15, 50, 177)
+    node = helper.make_node("TorchSoftmaxAvx512F32LastDim177", ["x"], ["y"], domain="merlin.source_preserving")
+    graph = helper.make_graph([node], "source_softmax177", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == shape
+    assert imported["main"].ret_struct_info.dtype == "float32"
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_softmax_avx512_") and isinstance(func, tvm.tir.PrimFunc))
+    assert int(prim.attrs["op_pattern"]) == 8
+    buffers = list(prim.buffer_map.values())
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(750, 177), (750, 177), (209,)]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    # Public ordinary Softmax still imports as the ordinary Relax operation.
+    ordinary = helper.make_node("Softmax", ["x"], ["y"], axis=-1)
+    graph = helper.make_graph([ordinary], "ordinary_softmax", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
+    original = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]))
+    assert not any(name.name_hint.startswith("torch_softmax_avx512_") for name in original.functions)
+
+
+def test_source_softmax177_refuses_ambiguous_or_unsupported_contracts():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 15, 50, 177), dtype=TensorProto.FLOAT, attributes=None, inputs=("x",), outputs=("y",)):
+        node = helper.make_node("TorchSoftmaxAvx512F32LastDim177", inputs, outputs, domain=domain, **(attributes or {}))
+        graph = helper.make_graph([node], "source_softmax177", [helper.make_tensor_value_info(name, dtype, shape) for name in inputs if name], [helper.make_tensor_value_info(name, dtype, shape) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"domain": "tvm.contrib.source_preserving"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"axis": -1}}, {"attributes": {"algorithm": "other"}}, {"attributes": {"tvm_custom": "ignored"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("",)}, {"inputs": ("x", "z")}, {"shape": (750, 177)}, {"shape": (2, 15, 50, 177)}, {"shape": (1, 14, 50, 177)}, {"shape": (1, 15, 49, 177)}, {"shape": (1, 15, 50, 176)}, {"shape": (1, 15, 50, 178)}, {"shape": (1, 15, 0, 177)}, {"shape": (1, 15, "N", 177)}, {"shape": ()}, {"shape": (1 << 61, 15, 50, 177)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
+def test_source_layernorm768_static_interface_and_private_scratch():
+    """The original scalar epsilon is constant and scratch is statically visible."""
+    shape = (1, 1024, 768)
+    node = helper.make_node("TorchLayerNormAvx2Bf16Width768", ["x", "gamma", "beta", "epsilon"], ["y"], domain="merlin.source_preserving")
+    inputs = [helper.make_tensor_value_info("x", TensorProto.BFLOAT16, shape), *[helper.make_tensor_value_info(name, TensorProto.BFLOAT16, (768,)) for name in ("gamma", "beta")]]
+    epsilon = onnx.numpy_helper.from_array(np.array(0x358637bd, dtype=np.uint32).view(np.float32), "epsilon")
+    graph = helper.make_graph([node], "source_layernorm768", inputs, [helper.make_tensor_value_info("y", TensorProto.BFLOAT16, shape)], [epsilon])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    assert imported["main"].ret_struct_info.dtype == "bfloat16"
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == shape
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_layernorm_avx2_") and isinstance(func, tvm.tir.PrimFunc))
+    assert int(prim.attrs["op_pattern"]) == 8
+    buffers = [prim.buffer_map[param] for param in prim.params]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(1024, 768), (768,), (768,), (), (1024, 768), (80,)]
+    assert [buffer.dtype for buffer in buffers] == ["bfloat16", "bfloat16", "bfloat16", "float32", "bfloat16", "float32"]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    # Ordinary LayerNormalization continues to use its ordinary importer.
+    ordinary = helper.make_node("LayerNormalization", ["x", "gamma", "beta"], ["y"], axis=-1, epsilon=1e-6)
+    ordinary_inputs = [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape), *[helper.make_tensor_value_info(name, TensorProto.FLOAT, (768,)) for name in ("gamma", "beta")]]
+    original = from_onnx(helper.make_model(helper.make_graph([ordinary], "ordinary_layernorm", ordinary_inputs, [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)]), opset_imports=[helper.make_opsetid("", 18)]))
+    assert not any(name.name_hint.startswith("torch_layernorm_avx2_") for name in original.functions)
+
+
+def test_source_layernorm768_refuses_ambiguous_geometry_or_epsilon():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 1024, 768), gamma_shape=(768,), beta_shape=(768,), dtype=TensorProto.BFLOAT16, gamma_dtype=TensorProto.BFLOAT16, beta_dtype=TensorProto.BFLOAT16, attributes=None, inputs=("x", "gamma", "beta", "epsilon"), outputs=("y",), epsilon_word=0x358637bd, epsilon_shape=(), epsilon_dtype=np.float32, dynamic_epsilon=False):
+        node = helper.make_node("TorchLayerNormAvx2Bf16Width768", inputs, outputs, domain=domain, **(attributes or {}))
+        specs = {"x": (dtype, shape), "gamma": (gamma_dtype, gamma_shape), "beta": (beta_dtype, beta_shape), "epsilon": (TensorProto.FLOAT, epsilon_shape)}
+        graph_inputs = [helper.make_tensor_value_info(name, *specs[name]) for name in inputs if name and (name != "epsilon" or dynamic_epsilon)]
+        epsilon = np.array(epsilon_word, dtype=np.uint32).view(np.float32).astype(epsilon_dtype).reshape(epsilon_shape)
+        initializer = [] if dynamic_epsilon else [onnx.numpy_helper.from_array(epsilon, "epsilon")]
+        graph = helper.make_graph([node], "source_layernorm768", graph_inputs, [helper.make_tensor_value_info(name, dtype, shape) for name in outputs], initializer)
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"axis": -1}}, {"attributes": {"epsilon": 1e-6}}, {"attributes": {"tvm_custom": "ignored"}}, {"inputs": ()}, {"inputs": ("x", "gamma", "beta")}, {"inputs": ("x", "gamma", "beta", "")}, {"inputs": ("x", "gamma", "beta", "epsilon", "x")}, {"outputs": ("y", "z")}, {"shape": (1024, 768)}, {"shape": (2, 1024, 768)}, {"shape": (1, 1023, 768)}, {"shape": (1, 1024, 767)}, {"shape": (1, 0, 768)}, {"shape": (1, "N", 768)}, {"shape": (1 << 61, 1024, 768)}, {"gamma_shape": (767,)}, {"gamma_shape": (1, 768)}, {"beta_shape": (767,)}, {"beta_shape": ("K",)}, {"dtype": TensorProto.FLOAT}, {"gamma_dtype": TensorProto.FLOAT}, {"beta_dtype": TensorProto.FLOAT}, {"dynamic_epsilon": True}, {"epsilon_shape": (1,)}, {"epsilon_dtype": np.float64}, *[{"epsilon_word": word} for word in (0, 0x358637bc, 0x358637be, 0xb58637bd, 0x7f800000, 0x7fc00000)]]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
 if __name__ == "__main__":
     tvm.testing.main()
