@@ -3237,5 +3237,79 @@ def test_fixed_tree_fp32_contract_refuses_ambiguous_or_unsupported_models():
     assert loops and set(loops) == {"int64"}
 
 
+def test_source_silu_fp32_independent_rounding_and_modes():
+    """Exact rational rounding oracle for the declared vector-source algorithm."""
+    from fractions import Fraction
+    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+
+    def nearest(value):
+        center = np.float32(float(value))
+        candidates = [np.nextafter(center, np.float32(-np.inf)), center, np.nextafter(center, np.float32(np.inf))]
+        return min(candidates, key=lambda item: (abs(Fraction.from_float(float(item)) - value), int(item.view(np.uint32)) & 1))
+
+    def rational(value):
+        return Fraction.from_float(float(np.float32(value)))
+
+    constants = np.array([0x3fb8aa3b, 0xbf317200, 0xb5bfbe8e, 0x39502bda, 0x3ab696c9, 0x3c0888a6, 0x3d2aaa7a, 0x3e2aaaab, 0x3f000000], dtype=np.uint32).view(np.float32)
+    values = np.random.default_rng(731).uniform(-80, 80, 64).astype(np.float32).reshape(2, 32)
+    values[0, :8] = [-0.24943915009498596, -0.0, 0.0, -80, 80, -1, 1, .5]
+    values[0, 8:14] = np.array([-.5, .5, -1.5, 1.5, -2.5, 2.5], dtype=np.float32) / constants[0]
+    expected = np.empty_like(values)
+    for index in np.ndindex(values.shape):
+        x = values[index]
+        if x == 0:
+            expected[index] = x
+            continue
+        d = -x
+        reduced = nearest(rational(d) * rational(constants[0]))
+        q = round(rational(reduced))  # Python rational nearest-even, including negative ties.
+        remainder = nearest(Fraction(q) * rational(constants[1]) + rational(d))
+        remainder = nearest(Fraction(q) * rational(constants[2]) + rational(remainder))
+        polynomial = constants[3]
+        for coefficient in constants[4:]:
+            polynomial = nearest(rational(polynomial) * rational(remainder) + rational(coefficient))
+        square = nearest(rational(remainder) ** 2)
+        polynomial = nearest(rational(square) * rational(polynomial) + rational(remainder))
+        unit = nearest(Fraction(1) + rational(polynomial))
+        half = q // 2
+        first = nearest(rational(unit) * Fraction(2) ** half)
+        exponent = nearest(rational(first) * Fraction(2) ** (q - half))
+        denominator = nearest(Fraction(1) + rational(exponent))
+        expected[index] = nearest(rational(x) / rational(denominator))
+    node = helper.make_node("TorchSiluAvx512F32", ["x"], ["y"], domain="merlin.source_preserving")
+    graph = helper.make_graph([node], "source_silu", [helper.make_tensor_value_info("x", TensorProto.FLOAT, values.shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, values.shape)])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    for optimized in (False, True):
+        prepared = prepare_gemmini_graph(imported, optimize=optimized)
+        prim = next(func for name, func in prepared.functions.items() if name.name_hint.startswith("torch_silu_avx512_") and isinstance(func, tvm.tir.PrimFunc))
+        assert int(prim.attrs["op_pattern"]) == 8
+        llvm = tvm.build(prim, target="llvm").get_source("ll")
+        assert "llvm.fma." in llvm and "llvm.fmuladd" not in llvm
+        assert "fdiv" in llvm and not __import__("re").search(r"\bf(?:add|mul|div)\s+(?:fast|reassoc|contract|arcp)\b", llvm)
+        assert "TVMBackendAllocWorkspace" not in llvm and "Sleef" not in llvm and "Torch" not in llvm
+        vm = relax.VirtualMachine(relax.build(prepared, "llvm"), tvm.cpu())
+        for _ in range(2):
+            np.testing.assert_array_equal(vm["main"](tvm.nd.array(values)).numpy().view(np.uint32), expected.view(np.uint32))
+        # Invalid values cannot reach a poisonous float-to-int conversion.
+        invalid = np.resize(np.array([np.nan, np.inf, -np.inf, -0.0, 0.0, -104, 104], dtype=np.float32), values.shape)
+        output = vm["main"](tvm.nd.array(invalid)).numpy()
+        assert np.isnan(output[np.isnan(invalid) | np.isneginf(invalid)]).all()
+        assert np.isposinf(output[np.isposinf(invalid)]).all()
+        assert np.array_equal(output[invalid == 0].view(np.uint32), invalid[invalid == 0].view(np.uint32))
+        assert np.all(output[invalid == 104] == 104) and np.all(output[invalid == -104] == 0)
+
+
+def test_source_silu_refuses_ambiguous_or_unsupported_contracts():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(2, 32), dtype=TensorProto.FLOAT, attributes=None, inputs=("x",), outputs=("y",), op_name="TorchSiluAvx512F32"):
+        node = helper.make_node(op_name, inputs, outputs, domain=domain, **(attributes or {}))
+        graph = helper.make_graph([node], "source_silu", [helper.make_tensor_value_info(name, dtype, shape) for name in inputs], [helper.make_tensor_value_info(name, dtype, shape) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    for options in [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"algorithm": "other"}}, {"outputs": ("y", "z")}, {"inputs": ("x", "z")}, {"op_name": "FixedTreeMeanSquares"}, {"shape": (2, 16)}, {"shape": (2, 0)}, {"shape": (2, "K")}, {"shape": ()}, {"shape": (1 << 61, 32)}, {"dtype": TensorProto.DOUBLE}]:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
 if __name__ == "__main__":
     tvm.testing.main()
