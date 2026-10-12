@@ -3949,6 +3949,79 @@ def source_silu(A:T.Buffer((T.int64({count}),), 'float32'), Y:T.Buffer((T.int64(
     return relax.op.reshape(result, shape)
 
 
+def _source_mean720_call(bb, value):
+    """Pinned PyTorch FP32 AVX2 cascade sum followed by direct division by 720.
+
+    Independently transcribed from PyTorch revision 449b1768410104d3ed79d3bcfe4ba1d65c7f22c0,
+    aten/src/ATen/native/cpu/SumKernel.cpp row_sum/vectorized_inner_sum and
+    aten/src/ATen/native/ReduceOps.cpp mean_out CPU sum_out/div_ path.
+    Source: https://github.com/pytorch/pytorch/tree/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0
+    PyTorch contributors, BSD-3-Clause: https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/LICENSE
+    Already-squared inputs remain external. Native-source identity and geometry
+    admission belong to the exporter; this operator specifies the eight-lane
+    arithmetic for positive static shapes ending in 720. Native equivalence on
+    arbitrary runtime values or dispatches is outside the scoped workload proof.
+    The private 65-word output makes 260 scratch bytes visible to static planning.
+    """
+    from tvm.script import tir as T  # pylint: disable=import-outside-toplevel
+
+    info = getattr(value, "struct_info", None)
+    if not isinstance(info, relax.TensorStructInfo) or info.dtype != "float32" or not isinstance(info.shape, relax.ShapeExpr):
+        raise ValueError("Source mean720 requires static FP32 tensors")
+    shape = tuple(int(dim) for dim in info.shape.values if isinstance(dim, tir.IntImm))
+    if len(shape) != len(info.shape.values) or not shape or any(dim <= 0 for dim in shape) or shape[-1] != 720:
+        raise ValueError("Source mean720 requires positive static shapes with last dimension 720")
+    rows = math.prod(shape[:-1])
+    if rows * 720 > ((1 << 63) - 1) // 4:
+        raise ValueError("Source mean720 FP32 storage exceeds the byte span")
+    source = f"""@T.prim_func
+def source_mean720(A:T.Buffer((T.int64({rows}),T.int64(720)), 'float32'), Y:T.Buffer((T.int64({rows}),T.int64(1)), 'float32'), S:T.Buffer((T.int64(65),), 'float32')):
+    T.func_attr({{'tir.noalias':True,'op_pattern':8}})
+    with T.block('root'):
+        for r in range(T.int64({rows})):
+            for j in range(T.int64(65)):
+                S[j]=T.float32(0)
+            for g in range(T.int64(16)):
+                for k,l in T.grid(T.int64(4),T.int64(8)):
+                    S[k*8+l]=S[k*8+l]+A[r,(g*4+k)*8+l]
+            for j in range(T.int64(32)):
+                S[32+j]=S[32+j]+S[j]
+                S[j]=T.float32(0)
+            for g in range(T.int64(6)):
+                for k,l in T.grid(T.int64(4),T.int64(8)):
+                    S[k*8+l]=S[k*8+l]+A[r,((g+16)*4+k)*8+l]
+            for j in range(T.int64(32)):
+                S[j]=S[j]+S[32+j]
+                S[j]=S[j]+T.float32(0)
+                S[j]=S[j]+T.float32(0)
+            for v in range(T.int64(2)):
+                for l in range(T.int64(8)):
+                    S[l]=S[l]+A[r,(v+88)*8+l]
+            for k in range(T.int64(3)):
+                for l in range(T.int64(8)):
+                    S[l]=S[l]+S[(k+1)*8+l]
+            for l in range(T.int64(8)):
+                S[64]=S[64]+S[l]
+            Y[r,0]=(T.float32(0)+S[64])/T.float32(720)
+"""
+    prim = tvm.script.from_source(source, extra_vars={"T": T}).without_attr("global_symbol")
+    global_var = bb.add_func(prim, "torch_mean720_fp32_v1")
+    flat = bb.normalize(relax.op.reshape(value, (rows, 720)))
+    outputs = [relax.TensorStructInfo((rows, 1), "float32"), relax.TensorStructInfo((65,), "float32")]
+    result = bb.normalize(relax.TupleGetItem(bb.emit(relax.call_tir(global_var, [flat], outputs)), 0))
+    return relax.op.reshape(result, shape[:-1] + (1,))
+
+
+class TorchMean720Fp32(OnnxOpConverter):
+    """merlin.source_preserving v1: FP32 eight-lane cascade mean, last-axis keepdim."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        if len(inputs) != 1 or inputs[0] is None:
+            raise ValueError("Source mean720 requires one tensor operand")
+        return _source_mean720_call(bb, inputs[0])
+
+
 class TorchSiluAvx512F32(OnnxOpConverter):
     """merlin.source_preserving v1: native vector exp/add/direct-div SiLU."""
 
@@ -3962,6 +4035,7 @@ class TorchSiluAvx512F32(OnnxOpConverter):
 def _get_convert_map():
     return {
         "TorchSiluAvx512F32": TorchSiluAvx512F32,
+        "TorchMean720Fp32": TorchMean720Fp32,
         "FixedTreeDot": FixedTreeDot,
         "FixedTreeMeanSquares": FixedTreeMeanSquares,
         # defs/experimental
@@ -4325,11 +4399,11 @@ class ONNXGraphImporter:
                     raise ValueError("Fixed-tree operators require exactly one merlin.fixed_order version 1 import")
                 if node.attribute or len(node.output) != 1:
                     raise ValueError("Fixed-tree operators require no attributes and one output")
-            if op_name == "TorchSiluAvx512F32" or node.domain == "merlin.source_preserving":
-                if node.domain != "merlin.source_preserving" or self._source_preserving_opsets != [1] or op_name != "TorchSiluAvx512F32":
-                    raise ValueError("Source SiLU requires exactly one merlin.source_preserving version 1 import")
+            if op_name in ("TorchSiluAvx512F32", "TorchMean720Fp32") or node.domain == "merlin.source_preserving":
+                if node.domain != "merlin.source_preserving" or self._source_preserving_opsets != [1] or op_name not in ("TorchSiluAvx512F32", "TorchMean720Fp32"):
+                    raise ValueError("Source operators require exactly one merlin.source_preserving version 1 import")
                 if node.attribute or len(node.output) != 1:
-                    raise ValueError("Source SiLU requires no attributes and one output")
+                    raise ValueError("Source operators require no attributes and one output")
             attr = self._parse_attr(node.attribute)
             # Create and populate input list.
             inputs = onnx_input()

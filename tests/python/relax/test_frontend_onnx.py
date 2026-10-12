@@ -3311,5 +3311,89 @@ def test_source_silu_refuses_ambiguous_or_unsupported_contracts():
             from_onnx(model(**options))
 
 
+def test_source_mean720_fp32_independent_rounding_and_modes():
+    """Independent exact-rational FP32 stage oracle, including remainder vectors."""
+    from fractions import Fraction
+    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+
+    def rational(value):
+        return Fraction.from_float(float(np.float32(value)))
+
+    def nearest(value):
+        if not value:
+            return np.float32(0)
+        center = np.float32(float(value))
+        candidates = [np.nextafter(center, np.float32(-np.inf)), center, np.nextafter(center, np.float32(np.inf))]
+        return min(candidates, key=lambda item: (abs(rational(item) - value), int(item.view(np.uint32)) & 1))
+
+    def add(left, right):
+        return nearest(rational(left) + rational(right))
+
+    def mean(row):
+        lanes = []
+        for lane in range(8):
+            streams = []
+            for stream in range(4):
+                block = np.float32(0)
+                for group in range(16):
+                    block = add(block, row[(4 * group + stream) * 8 + lane])
+                block = add(np.float32(0), block)
+                tail = np.float32(0)
+                for group in range(16, 22):
+                    tail = add(tail, row[(4 * group + stream) * 8 + lane])
+                streams.append(add(add(add(tail, block), np.float32(0)), np.float32(0)))
+            total = streams[0]
+            for offset in (704, 712):
+                total = add(total, row[offset + lane])
+            for stream in streams[1:]:
+                total = add(total, stream)
+            lanes.append(total)
+        total = np.float32(0)
+        for lane in lanes:
+            total = add(total, lane)
+        return nearest(rational(add(np.float32(0), total)) / 720)
+
+    values = np.random.default_rng(72053).standard_normal((1, 6, 720)).astype(np.float32)
+    values[0, 1] = np.exp2(np.random.default_rng(51).integers(-140, 20, 720)).astype(np.float32)
+    values[0, 2] = -np.float32(0)
+    values[0, 3] = np.nextafter(np.float32(0), np.float32(1))
+    values[0, 4] = 0
+    values[0, 4, [0, 511, 512, 703, 704, 711, 712, 719]] = [1, 2, 4, 8, 16, 32, 64, 128]
+    values[0, 5, ::3] = 1
+    values[0, 5, 1::3] = -1
+    values[0, 5, 2::3] = np.float32(2**-24)
+    expected = np.array([mean(row) for row in values.reshape(-1, 720)], dtype=np.float32).reshape(1, 6, 1)
+    assert expected[0, 2, 0].view(np.uint32) == 0 and expected[0, 3, 0].view(np.uint32) == 1
+    for data, reference in [(values, expected), (values[0, 0], expected[0, 0])]:
+        node = helper.make_node("TorchMean720Fp32", ["x"], ["y"], domain="merlin.source_preserving")
+        graph = helper.make_graph([node], "source_mean720", [helper.make_tensor_value_info("x", TensorProto.FLOAT, data.shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, reference.shape)])
+        imported = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)]))
+        for optimized in (False, True):
+            prepared = prepare_gemmini_graph(imported, optimize=optimized)
+            prim = next(func for name, func in prepared.functions.items() if name.name_hint.startswith("torch_mean720_") and isinstance(func, tvm.tir.PrimFunc))
+            assert int(prim.attrs["op_pattern"]) == 8
+            buffers = list(prim.buffer_map.values())
+            assert tuple(int(dim) for dim in buffers[-1].shape) == (65,)
+            assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+            llvm = tvm.build(prim, target="llvm").get_source("ll")
+            assert "fdiv" in llvm and not __import__("re").search(r"\bf(?:add|mul|div)\s+(?:fast|reassoc|contract|arcp)\b|llvm\.(?:fma|fmuladd)", llvm)
+            assert "TVMBackendAllocWorkspace" not in llvm and "Torch" not in llvm and "Sleef" not in llvm
+            vm = relax.VirtualMachine(relax.build(prepared, "llvm"), tvm.cpu())
+            for _ in range(2):
+                np.testing.assert_array_equal(vm["main"](tvm.nd.array(data)).numpy().view(np.uint32), reference.view(np.uint32))
+
+
+def test_source_mean720_refuses_ambiguous_or_unsupported_contracts():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 50, 720), dtype=TensorProto.FLOAT, attributes=None, inputs=("x",), outputs=("y",)):
+        node = helper.make_node("TorchMean720Fp32", inputs, outputs, domain=domain, **(attributes or {}))
+        output_shape = tuple(shape[:-1]) + (1,) if shape else (1,)
+        graph = helper.make_graph([node], "source_mean720", [helper.make_tensor_value_info(name, dtype, shape) for name in inputs], [helper.make_tensor_value_info(name, dtype, output_shape) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    for options in [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"keepdims": 1}}, {"attributes": {"axes": [-1]}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("x", "z")}, {"shape": (1, 50, 719)}, {"shape": (0, 720)}, {"shape": ("N", 720)}, {"shape": ()}, {"shape": (1 << 61, 720)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16}]:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
 if __name__ == "__main__":
     tvm.testing.main()
