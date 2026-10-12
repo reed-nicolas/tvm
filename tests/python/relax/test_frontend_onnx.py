@@ -3160,5 +3160,82 @@ def test_shape_dim_string_expression_graph_div_2():
     tvm.ir.assert_structural_equal(tvm_model, Expected)
 
 
+def test_fixed_tree_fp32_contract_preserves_rounding_and_query_shape():
+    import re
+    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+
+    def tree(products):
+        values = products.copy()
+        while values.shape[-1] > 1:
+            values = np.add(values[..., ::2], values[..., 1::2], dtype=np.float32)
+        return values
+
+    generator = np.random.default_rng(181)
+    a = generator.standard_normal((1, 2, 3, 64)).astype("float32")
+    b = generator.standard_normal((1, 2, 5, 64)).astype("float32")
+    a[0, 0, 0] = 0
+    a[0, 0, 0, :4] = [33554432, 1, -33554432, 1]
+    b[0, 0, 0] = 1
+    expected = tree(np.multiply(a[..., :, None, :], b[..., None, :, :], dtype=np.float32))[..., 0]
+    assert expected[0, 0, 0, 0] == 0
+    sequential = np.float32(0)
+    for value in a[0, 0, 0]:
+        sequential = np.float32(sequential + value)
+    assert sequential == 1
+    squares = generator.standard_normal((2, 2048)).astype("float32")
+    mean = np.multiply(tree(np.multiply(squares, squares, dtype=np.float32)), np.float32(1 / 2048), dtype=np.float32)
+    cases = [("FixedTreeDot", [a, b], expected), ("FixedTreeDot", [a[:, :, -1:].copy(), b], expected[:, :, -1:]), ("FixedTreeMeanSquares", [squares], mean), ("FixedTreeMeanSquares", [np.array([[-0.0], [2.0]], dtype="float32")], np.array([[0.0], [4.0]], dtype="float32"))]
+    for op_name, inputs, reference in cases:
+        names = [f"x{i}" for i in range(len(inputs))]
+        graph = helper.make_graph([helper.make_node(op_name, names, ["y"], domain="merlin.fixed_order")], "ordered", [helper.make_tensor_value_info(name, TensorProto.FLOAT, value.shape) for name, value in zip(names, inputs)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, reference.shape)])
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.fixed_order", 1)])
+        imported = from_onnx(model)
+        for optimized in (False, True):
+            prepared = prepare_gemmini_graph(imported, optimize=optimized)
+            functions = [func for name, func in prepared.functions.items() if name.name_hint.startswith("fixed_tree_") and isinstance(func, tvm.tir.PrimFunc)]
+            assert len(functions) == 1 and int(functions[0].attrs["op_pattern"]) == 8
+            llvm = tvm.build(functions[0], target="llvm").get_source("ll")
+            assert not re.search(r"\bf(?:add|mul)\s+(?:fast|reassoc|contract)\b|llvm\.(?:fma|fmuladd)", llvm)
+            assert "TVMBackendAllocWorkspace" not in llvm and "TVMBackendFreeWorkspace" not in llvm
+            vm = relax.VirtualMachine(relax.build(prepared, "llvm"), tvm.cpu())
+            for _ in range(2):
+                output = vm["main"](*[tvm.nd.array(value) for value in inputs]).numpy()
+                np.testing.assert_array_equal(output.view("uint32"), reference.view("uint32"))
+    # Different shape specializations must coexist with distinct generated symbols.
+    inputs = [a, b, a[:, :, -1:].copy(), squares]
+    names = [f"x{i}" for i in range(4)]
+    references = [expected, expected[:, :, -1:], mean]
+    nodes = [helper.make_node("FixedTreeDot", ["x0", "x1"], ["y0"], domain="merlin.fixed_order"), helper.make_node("FixedTreeDot", ["x2", "x1"], ["y1"], domain="merlin.fixed_order"), helper.make_node("FixedTreeMeanSquares", ["x3"], ["y2"], domain="merlin.fixed_order")]
+    graph = helper.make_graph(nodes, "multiple_ordered_shapes", [helper.make_tensor_value_info(name, TensorProto.FLOAT, value.shape) for name, value in zip(names, inputs)], [helper.make_tensor_value_info(f"y{i}", TensorProto.FLOAT, value.shape) for i, value in enumerate(references)])
+    imported = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.fixed_order", 1)]))
+    for optimized in (False, True):
+        vm = relax.VirtualMachine(relax.build(prepare_gemmini_graph(imported, optimize=optimized), "llvm"), tvm.cpu())
+        for output, reference in zip(vm["main"](*[tvm.nd.array(value) for value in inputs]), references):
+            np.testing.assert_array_equal(output.numpy().view("uint32"), reference.view("uint32"))
+
+
+def test_fixed_tree_fp32_contract_refuses_ambiguous_or_unsupported_models():
+    def model(op_name="FixedTreeMeanSquares", domain="merlin.fixed_order", versions=(1,), shapes=((2, 64),), dtype=TensorProto.FLOAT, attributes=None, outputs=("y",)):
+        names = [f"x{i}" for i in range(len(shapes))]
+        node = helper.make_node(op_name, names, outputs, domain=domain, **(attributes or {}))
+        graph = helper.make_graph([node], "ordered", [helper.make_tensor_value_info(name, dtype, shape) for name, shape in zip(names, shapes)], [helper.make_tensor_value_info(name, dtype, [2, 1]) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.fixed_order", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"algorithm": "tree"}}, {"attributes": {"tvm_custom": "ignored"}}, {"outputs": ("y", "z")}, {"shapes": ((2, 3),)}, {"shapes": ((2, 8192),)}, {"shapes": ((2, 0),)}, {"shapes": ((2, "K"),)}, {"shapes": ((),)}, {"dtype": TensorProto.DOUBLE}, {"shapes": ((2, 64), (2, 64))}, {"op_name": "FixedTreeDot", "shapes": ((2, 64), (2, 64))}, {"op_name": "FixedTreeDot", "shapes": ((1, 2, 3, 64), (1, 3, 4, 64))}, {"op_name": "FixedTreeDot", "shapes": ((1, 2, 3, 64), (1, 2, 4, 32))}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+    for shapes in (((1, 1, 1 << 61, 1), (1, 1, 1, 1)), ((1, 1, 1 << 31, 1), (1, 1, 1 << 31, 1))):
+        with pytest.raises(ValueError, match="storage|byte span"):
+            from_onnx(model(op_name="FixedTreeDot", shapes=shapes))
+    # Inspect a byte-span-valid output exceeding int32 without allocating it.
+    large = from_onnx(model(op_name="FixedTreeDot", shapes=((1, 1, 65536, 64), (1, 1, 65536, 64))))
+    prim = next(func for func in large.functions.values() if isinstance(func, tvm.tir.PrimFunc))
+    assert all(dim.dtype == "int64" for buffer in prim.buffer_map.values() for dim in buffer.shape)
+    loops = []
+    tvm.tir.stmt_functor.post_order_visit(prim.body, lambda node: loops.append(node.loop_var.dtype) if isinstance(node, tvm.tir.For) else None)
+    assert loops and set(loops) == {"int64"}
+
+
 if __name__ == "__main__":
     tvm.testing.main()

@@ -3788,8 +3788,88 @@ class SequenceAt(OnnxOpConverter):
         return input_sequence[position]
 
 
+def _fixed_tree_input(value):
+    """Admit bounded static FP32 operands for the versioned ordered CPU contract."""
+    info = getattr(value, "struct_info", None)
+    if not isinstance(info, relax.TensorStructInfo) or info.dtype != "float32" or not isinstance(info.shape, relax.ShapeExpr):
+        raise ValueError("Fixed-tree operators require static FP32 tensors")
+    shape = tuple(int(dim) for dim in info.shape.values if isinstance(dim, tir.IntImm))
+    if len(shape) != len(info.shape.values) or not shape or any(dim <= 0 for dim in shape):
+        raise ValueError("Fixed-tree operators require positive static dimensions")
+    k = shape[-1]
+    if k > 4096 or k & (k - 1) or math.prod(shape) > ((1 << 63) - 1) // 4:
+        raise ValueError("Fixed-tree operators require power-of-two K <= 4096 and bounded FP32 storage")
+    return shape
+
+
+def _fixed_tree_call(bb, inputs, dot):
+    """Separate FP32 products and adjacent-pair additions; never reassociate a reduction."""
+    from tvm.script import tir as T  # pylint: disable=import-outside-toplevel
+
+    shapes = [_fixed_tree_input(value) for value in inputs]
+    k = shapes[0][-1]
+    typed_shape = lambda shape: "(" + ", ".join(f"T.int64({dim})" for dim in shape) + ",)"
+    if dot:
+        if any(len(shape) != 4 for shape in shapes) or shapes[0][:2] != shapes[1][:2] or k != shapes[1][-1]:
+            raise ValueError("FixedTreeDot requires [B,H,M,K] and [B,H,N,K] with matching B/H/K")
+        batch, heads, rows, _ = shapes[0]
+        columns = shapes[1][2]
+        output_shape = (batch, heads, rows, columns)
+        if math.prod(output_shape) > ((1 << 63) - 1) // 4:
+            raise ValueError("FixedTreeDot output storage exceeds the FP32 byte span")
+        lines = ["@T.prim_func", f"def fixed_tree_dot(A: T.Buffer({typed_shape(shapes[0])}, 'float32'), B: T.Buffer({typed_shape(shapes[1])}, 'float32'), C: T.Buffer({typed_shape(output_shape)}, 'float32'), scratch: T.Buffer((T.int64({k}),), 'float32')):"]
+        lines += ["    T.func_attr({'tir.noalias': True, 'op_pattern': 8})", f"    for b, h, m, n in T.grid(T.int64({batch}), T.int64({heads}), T.int64({rows}), T.int64({columns})):", f"        for i in range(T.int64({k})):", "            scratch[i] = A[b, h, m, i] * B[b, h, n, i]"]
+        final = "C[b, h, m, n] = scratch[0]"
+        arguments = inputs
+        name = "fixed_tree_dot_fp32_v1"
+    else:
+        rows = math.prod(shapes[0][:-1])
+        output_shape = shapes[0][:-1] + (1,)
+        lines = ["@T.prim_func", f"def fixed_tree_mean_squares(A: T.Buffer({typed_shape((rows, k))}, 'float32'), C: T.Buffer({typed_shape((rows, 1))}, 'float32'), scratch: T.Buffer((T.int64({k}),), 'float32')):"]
+        lines += ["    T.func_attr({'tir.noalias': True, 'op_pattern': 8})", f"    for row in range(T.int64({rows})):", f"        for i in range(T.int64({k})):", "            scratch[i] = A[row, i] * A[row, i]"]
+        final = f"C[row, 0] = scratch[0] * T.float32({1.0 / k!r})"
+        arguments = [bb.normalize(relax.op.reshape(inputs[0], (rows, k)))]
+        name = "fixed_tree_mean_squares_fp32_v1"
+    width = k
+    while width > 1:
+        width //= 2
+        lines += [f"        for i in range(T.int64({width})):", "            scratch[i] = scratch[2 * i] + scratch[2 * i + 1]"]
+    lines.append("        " + final)
+    # Preserve the root block expected by Relax's TIR analyses. Scratch is an
+    # explicit private output so static planning accounts for it without a heap.
+    lines = lines[:3] + ["    with T.block('root'):"] + ["    " + line for line in lines[3:]]
+    prim_func = tvm.script.from_source("\n".join(lines), extra_vars={"T": T}).without_attr("global_symbol")
+    global_var = bb.add_func(prim_func, name)
+    result_shape = output_shape if dot else (rows, 1)
+    outputs = [relax.TensorStructInfo(result_shape, "float32"), relax.TensorStructInfo((k,), "float32")]
+    result = bb.normalize(relax.TupleGetItem(bb.emit(relax.call_tir(global_var, arguments, outputs)), 0))
+    return result if dot else relax.op.reshape(bb.normalize(result), output_shape)
+
+
+class FixedTreeDot(OnnxOpConverter):
+    """merlin.fixed_order v1: separately rounded FP32 products and balanced adjacent sums."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        if len(inputs) != 2 or any(value is None for value in inputs):
+            raise ValueError("FixedTreeDot requires two tensor operands")
+        return _fixed_tree_call(bb, inputs, dot=True)
+
+
+class FixedTreeMeanSquares(OnnxOpConverter):
+    """merlin.fixed_order v1: ordered FP32 square sum times the exact power-of-two reciprocal."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        if len(inputs) != 1 or inputs[0] is None:
+            raise ValueError("FixedTreeMeanSquares requires one tensor operand")
+        return _fixed_tree_call(bb, inputs, dot=False)
+
+
 def _get_convert_map():
     return {
+        "FixedTreeDot": FixedTreeDot,
+        "FixedTreeMeanSquares": FixedTreeMeanSquares,
         # defs/experimental
         # "Optional": Optional_,
         # "OptionalHasElement": OptionalHasElement,
@@ -3995,6 +4075,7 @@ class ONNXGraphImporter:
         self._sanitize: bool = sanitize
         self.bb: relax.BlockBuilder = relax.BlockBuilder()  # pylint: disable=invalid-name
         self._params = {}
+        self._fixed_order_opsets = []
 
     def from_onnx(self, graph: onnx.onnx_ml_pb2.ModelProto, opset: int) -> IRModule:
         """Construct Relax expressions from the ONNX graph.
@@ -4144,6 +4225,11 @@ class ONNXGraphImporter:
         """Nodes are stored as directed acyclic graph."""
         for node in graph.node:
             op_name = node.op_type
+            if op_name in ("FixedTreeDot", "FixedTreeMeanSquares") or node.domain == "merlin.fixed_order":
+                if node.domain != "merlin.fixed_order" or self._fixed_order_opsets != [1] or op_name not in ("FixedTreeDot", "FixedTreeMeanSquares"):
+                    raise ValueError("Fixed-tree operators require exactly one merlin.fixed_order version 1 import")
+                if node.attribute or len(node.output) != 1:
+                    raise ValueError("Fixed-tree operators require no attributes and one output")
             attr = self._parse_attr(node.attribute)
             # Create and populate input list.
             inputs = onnx_input()
@@ -4192,7 +4278,8 @@ class ONNXGraphImporter:
                 ):
                     raise ValueError(f"Node {node.name} cannot handle ShapeExpr inputs.")
             try:
-                op = self._convert_operator(op_name, inputs, attr, self.opset)
+                node_opset = 1 if node.domain == "merlin.fixed_order" else self.opset
+                op = self._convert_operator(op_name, inputs, attr, node_opset)
                 # Create struct information for the new operator.
                 op = self.bb.normalize(op)
             except TVMError as err:
@@ -4361,6 +4448,7 @@ def from_onnx(
         sanitize=sanitize_input_names,
     )
     graph = model.graph
+    g._fixed_order_opsets = [int(entry.version) for entry in model.opset_import if entry.domain == "merlin.fixed_order"]
 
     try:
         opset_in_model = 1
