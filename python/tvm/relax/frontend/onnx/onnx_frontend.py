@@ -4195,8 +4195,8 @@ class TorchLayerNormAvx2Bf16Width768(OnnxOpConverter):
         return _source_layernorm768_call(bb, *inputs)
 
 
-def _source_softmax177_call(bb, value):
-    """Pinned SmolVLA FP32 last-axis softmax, including its one-word vector tail.
+def _source_softmax_call(bb, value, width):
+    """Pinned SmolVLA FP32 last-axis softmax, with the valid vector tail.
 
     PyTorch 449b1768410104d3ed79d3bcfe4ba1d65c7f22c0 SoftMaxKernel.cpp
     _vec_softmax_lastdim<float> and functional_base.h AVX512 reduce_all:
@@ -4211,46 +4211,51 @@ def _source_softmax177_call(bb, value):
     logits *and* finite shifted subtractions, with positive finite sums. These
     are proof conditions, not exported runtime guards. This approximation is
     source arithmetic, not a universally correctly rounded mathematical exp.
-    The explicit private 209-word output exposes 836 scratch bytes to planning.
+    The private width+32-word output exposes its scratch bytes to planning.
     """
     from tvm.script import tir as T  # pylint: disable=import-outside-toplevel
 
+    if width not in (177, 227):
+        raise ValueError("Source softmax requires an admitted width")
+    scratch, work = width + 32, width + 16
+    groups, tail_start, tail = width // 16 - 1, width // 16 * 16, width % 16
     info = getattr(value, "struct_info", None)
     if not isinstance(info, relax.TensorStructInfo) or info.dtype != "float32" or not isinstance(info.shape, relax.ShapeExpr):
-        raise ValueError("Source softmax177 requires a static FP32 tensor")
+        raise ValueError("Source softmax requires a static FP32 tensor")
     shape = tuple(int(dim) for dim in info.shape.values if isinstance(dim, tir.IntImm))
-    if len(shape) != len(info.shape.values) or shape != (1, 15, 50, 177):
-        raise ValueError("Source softmax177 requires the bound SmolVLA shape [1,15,50,177]")
+    if len(shape) != len(info.shape.values) or shape != (1, 15, 50, width):
+        raise ValueError(f"Source softmax requires the bound SmolVLA shape [1,15,50,{width}]")
     if math.prod(shape) > ((1 << 63) - 1) // 4:
-        raise ValueError("Source softmax177 FP32 storage exceeds the byte span")
-    source = """@T.prim_func
-def source_softmax177(A:T.Buffer((T.int64(750),T.int64(177)), 'float32'), Y:T.Buffer((T.int64(750),T.int64(177)), 'float32'), S:T.Buffer((T.int64(209),), 'float32')):
-    T.func_attr({'tir.noalias':True,'op_pattern':8})
+        raise ValueError("Source softmax FP32 storage exceeds the byte span")
+    source = f"""@T.prim_func
+def source_softmax{width}(A:T.Buffer((T.int64(750),T.int64({width})), 'float32'), Y:T.Buffer((T.int64(750),T.int64({width})), 'float32'), S:T.Buffer((T.int64({scratch}),), 'float32')):
+    T.func_attr({{'tir.noalias':True,'op_pattern':8}})
     with T.block('root'):
         for r in range(T.int64(750)):
             for l in range(T.int64(16)):
-                S[177+l]=A[r,l]
-            for g,l in T.grid(T.int64(10),T.int64(16)):
-                S[177+l]=T.max(S[177+l],A[r,(g+1)*16+l])
-            S[177]=T.max(S[177],A[r,176])
+                S[{width}+l]=A[r,l]
+            for g,l in T.grid(T.int64({groups}),T.int64(16)):
+                S[{width}+l]=T.max(S[{width}+l],A[r,(g+1)*16+l])
+            for t in range(T.int64({tail})):
+                S[{width}+t]=T.max(S[{width}+t],A[r,{tail_start}+t])
             for l in range(T.int64(16)):
-                S[193+l]=T.max(S[177+l],S[177+T.bitwise_xor(l,T.int64(8))])
+                S[{work}+l]=T.max(S[{width}+l],S[{width}+T.bitwise_xor(l,T.int64(8))])
             for l in range(T.int64(16)):
-                S[177+l]=S[193+l]
+                S[{width}+l]=S[{work}+l]
             for l in range(T.int64(16)):
-                S[193+l]=T.max(S[177+l],S[177+T.bitwise_xor(l,T.int64(4))])
+                S[{work}+l]=T.max(S[{width}+l],S[{width}+T.bitwise_xor(l,T.int64(4))])
             for l in range(T.int64(16)):
-                S[177+l]=S[193+l]
+                S[{width}+l]=S[{work}+l]
             for l in range(T.int64(16)):
-                S[193+l]=T.max(S[177+l],S[177+T.bitwise_xor(l,T.int64(2))])
+                S[{work}+l]=T.max(S[{width}+l],S[{width}+T.bitwise_xor(l,T.int64(2))])
             for l in range(T.int64(16)):
-                S[177+l]=S[193+l]
+                S[{width}+l]=S[{work}+l]
             for l in range(T.int64(16)):
-                S[193+l]=T.max(S[177+l],S[177+T.bitwise_xor(l,T.int64(1))])
+                S[{work}+l]=T.max(S[{width}+l],S[{width}+T.bitwise_xor(l,T.int64(1))])
             for l in range(T.int64(16)):
-                S[177+l]=S[193+l]
-            maximum=S[177]
-            for i in range(T.int64(177)):
+                S[{width}+l]=S[{work}+l]
+            maximum=S[{width}]
+            for i in range(T.int64({width})):
                 d=A[r,i]-maximum
                 core=T.max(d,T.float32(-104))
                 multiplied=core*T.reinterpret('float32',T.uint32(0x3fb8aa3b))
@@ -4275,39 +4280,48 @@ def source_softmax177(A:T.Buffer((T.int64(750),T.int64(177)), 'float32'), Y:T.Bu
                 scaled=first*T.reinterpret('float32',T.shift_left(q-half+127,23))
                 S[i]=T.Select(d<T.float32(-104),T.float32(0),scaled)
             for l in range(T.int64(16)):
-                S[177+l]=S[l]
-            for g,l in T.grid(T.int64(10),T.int64(16)):
-                S[177+l]=S[177+l]+S[(g+1)*16+l]
-            S[177]=S[177]+S[176]
+                S[{width}+l]=S[l]
+            for g,l in T.grid(T.int64({groups}),T.int64(16)):
+                S[{width}+l]=S[{width}+l]+S[(g+1)*16+l]
+            for t in range(T.int64({tail})):
+                S[{width}+t]=S[{width}+t]+S[{tail_start}+t]
             for l in range(T.int64(16)):
-                S[193+l]=S[177+l]+S[177+T.bitwise_xor(l,T.int64(8))]
+                S[{work}+l]=S[{width}+l]+S[{width}+T.bitwise_xor(l,T.int64(8))]
             for l in range(T.int64(16)):
-                S[177+l]=S[193+l]
+                S[{width}+l]=S[{work}+l]
             for l in range(T.int64(16)):
-                S[193+l]=S[177+l]+S[177+T.bitwise_xor(l,T.int64(4))]
+                S[{work}+l]=S[{width}+l]+S[{width}+T.bitwise_xor(l,T.int64(4))]
             for l in range(T.int64(16)):
-                S[177+l]=S[193+l]
+                S[{width}+l]=S[{work}+l]
             for l in range(T.int64(16)):
-                S[193+l]=S[177+l]+S[177+T.bitwise_xor(l,T.int64(2))]
+                S[{work}+l]=S[{width}+l]+S[{width}+T.bitwise_xor(l,T.int64(2))]
             for l in range(T.int64(16)):
-                S[177+l]=S[193+l]
+                S[{width}+l]=S[{work}+l]
             for l in range(T.int64(16)):
-                S[193+l]=S[177+l]+S[177+T.bitwise_xor(l,T.int64(1))]
+                S[{work}+l]=S[{width}+l]+S[{width}+T.bitwise_xor(l,T.int64(1))]
             for l in range(T.int64(16)):
-                S[177+l]=S[193+l]
-            reciprocal=T.float32(1)/S[177]
-            for i in range(T.int64(177)):
+                S[{width}+l]=S[{work}+l]
+            reciprocal=T.float32(1)/S[{width}]
+            for i in range(T.int64({width})):
                 Y[r,i]=S[i]*reciprocal
 """
     prim = tvm.script.from_source(source, extra_vars={"T": T}).without_attr("global_symbol")
-    global_var = bb.add_func(prim, "torch_softmax_avx512_fp32_lastdim177_v1")
-    flat = bb.normalize(relax.op.reshape(value, (750, 177)))
-    outputs = [relax.TensorStructInfo((750, 177), "float32"), relax.TensorStructInfo((209,), "float32")]
+    global_var = bb.add_func(prim, f"torch_softmax_avx512_fp32_lastdim{width}_v1")
+    flat = bb.normalize(relax.op.reshape(value, (750, width)))
+    outputs = [relax.TensorStructInfo((750, width), "float32"), relax.TensorStructInfo((scratch,), "float32")]
     result = bb.normalize(relax.TupleGetItem(bb.emit(relax.call_tir(global_var, [flat], outputs)), 0))
     return relax.op.reshape(result, shape)
 
 
-def _source_mkl_sgemm177_call(bb, left, right, kind):
+def _source_softmax177_call(bb, value):
+    return _source_softmax_call(bb, value, 177)
+
+
+def _source_softmax227_call(bb, value):
+    return _source_softmax_call(bb, value, 227)
+
+
+def _source_mkl_sgemm177_call(bb, left, right, kind, width=177):
     """Scoped native oneMKL AVX512 QK/PV: increasing-K IEEE FP32 FMA.
 
     Reconstructed from the pinned libtorch_cpu.so MKL kernel entry/packing
@@ -4322,7 +4336,9 @@ def _source_mkl_sgemm177_call(bb, left, right, kind):
     """
     from tvm.script import tir as T  # pylint: disable=import-outside-toplevel
 
-    reduction, columns = (64, 177) if kind == "qk" else (177, 64)
+    if (kind, width) not in (("qk", 177), ("pv", 177), ("qk", 227)):
+        raise ValueError("Unsupported source SGEMM geometry")
+    reduction, columns = (64, width) if kind == "qk" else (width, 64)
     expected = ((1, 15, 50, reduction), (1, 15, reduction, columns))
     for value, required in zip((left, right), expected):
         info = getattr(value, "struct_info", None)
@@ -4351,7 +4367,7 @@ def source_mkl_sgemm(A:T.Buffer((T.int64({left_count}),),'float32'), B:T.Buffer(
      Y[(h*T.int64(50)+m)*T.int64({columns})+n]=S[0]
 """
     prim = tvm.script.from_source(source, extra_vars={"T": T}).without_attr("global_symbol")
-    global_var = bb.add_func(prim, f"torch_mkl_sgemm_fp32_{kind}177_v1")
+    global_var = bb.add_func(prim, f"torch_mkl_sgemm_fp32_{kind}{width}_v1")
     args = [bb.normalize(relax.op.reshape(value, (size,))) for value, size in zip((left, right), (left_count, right_count))]
     outputs = [relax.TensorStructInfo((count,), "float32"), relax.TensorStructInfo((1,), "float32")]
     result = bb.normalize(relax.TupleGetItem(bb.emit(relax.call_tir(global_var, args, outputs)), 0))
@@ -4376,6 +4392,80 @@ class TorchMklSgemmF32PV177(OnnxOpConverter):
         if len(inputs) != 2 or any(value is None for value in inputs):
             raise ValueError("Source PV SGEMM requires two tensor operands")
         return _source_mkl_sgemm177_call(bb, inputs[0], inputs[1], "pv")
+
+
+def _source_onednn_bf16_pv227_call(bb, left, right):
+    """Bounded oneDNN AVX512 emulated BF16 GEMM source-family recurrence.
+
+    Installed JIT bytes and all four isolated compute variants establish the
+    high-partner then low-partner FP32 FMA order, including the odd positive-zero
+    partner. Actual native terminals agree; original internal packing/selected
+    variant were not observed. Alpha one and beta zero follow ordinary MatMul
+    semantics. Source identity, dispatch, physical layouts and finite/RNE/gradual
+    context are exporter admission obligations. One terminal BF16 RNE is explicit;
+    private FP32 accumulator storage is exposed for memory accounting.
+    """
+    from tvm.script import tir as T  # pylint: disable=import-outside-toplevel
+
+    k, n, dtype, itemsize = 227, 64, "bfloat16", 2
+    expected = ((1, 15, 50, k), (1, 15, k, n))
+    for value, required in zip((left, right), expected):
+        info = getattr(value, "struct_info", None)
+        if not isinstance(info, relax.TensorStructInfo) or info.dtype != dtype or not isinstance(info.shape, relax.ShapeExpr):
+            raise ValueError("Source contraction requires static tensors of admitted dtype")
+        if any(not isinstance(d, tir.IntImm) for d in info.shape.values):
+            raise ValueError("Source contraction requires static integer dimensions")
+        shape = tuple(int(d) for d in info.shape.values)
+        if any(d <= 0 for d in shape) or math.prod(shape) > ((1 << 63) - 1) // itemsize:
+            raise ValueError("Source contraction storage exceeds int64 byte span")
+        if shape != required:
+            raise ValueError("Source contraction requires admitted manual-denoiser geometry")
+    left_count, right_count = (math.prod(s) for s in expected)
+    count = 15 * 50 * n
+    arithmetic = """     for z in range(T.int64(113)):
+      S[0]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),T.Cast('float32',A[(h*T.int64(50)+m)*T.int64(227)+z*T.int64(2)+T.int64(1)]),T.Cast('float32',B[(h*T.int64(227)+z*T.int64(2)+T.int64(1))*T.int64(64)+n]),S[0])
+      S[0]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),T.Cast('float32',A[(h*T.int64(50)+m)*T.int64(227)+z*T.int64(2)]),T.Cast('float32',B[(h*T.int64(227)+z*T.int64(2))*T.int64(64)+n]),S[0])
+     S[0]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),T.float32(0),T.Cast('float32',A[(h*T.int64(50)+m)*T.int64(227)+T.int64(226)]),S[0])
+     S[0]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),T.Cast('float32',A[(h*T.int64(50)+m)*T.int64(227)+T.int64(226)]),T.Cast('float32',B[(h*T.int64(227)+T.int64(226))*T.int64(64)+n]),S[0])
+     bits=T.reinterpret('uint32',S[0])
+     rounded=bits+T.uint32(32767)+T.bitwise_and(T.shift_right(bits,T.uint32(16)),T.uint32(1))
+     Y[(h*T.int64(50)+m)*T.int64(64)+n]=T.reinterpret('bfloat16',T.Cast('uint16',T.shift_right(rounded,T.uint32(16))))
+"""
+    source = f"""@T.prim_func
+def source_attention227(A:T.Buffer((T.int64({left_count}),),'{dtype}'),B:T.Buffer((T.int64({right_count}),),'{dtype}'),Y:T.Buffer((T.int64({count}),),'{dtype}'),S:T.Buffer((T.int64(1),),'float32')):
+ T.func_attr({{'tir.noalias':True,'op_pattern':8}})
+ with T.block('root'):
+  for h in range(T.int64(15)):
+   for m in range(T.int64(50)):
+    for n in range(T.int64({n})):
+     S[0]=T.float32(0)
+{arithmetic}"""
+    prim = tvm.script.from_source(source, extra_vars={"T": T}).without_attr("global_symbol")
+    global_var = bb.add_func(prim, "torch_onednn_gemm_bf16_pv227_v1")
+    args = [bb.normalize(relax.op.reshape(value, (size,))) for value, size in zip((left, right), (left_count, right_count))]
+    outputs = [relax.TensorStructInfo((count,), dtype), relax.TensorStructInfo((1,), "float32")]
+    result = bb.normalize(relax.TupleGetItem(bb.emit(relax.call_tir(global_var, args, outputs)), 0))
+    return relax.op.reshape(result, (1, 15, 50, n))
+
+
+class TorchMklSgemmF32QK227(OnnxOpConverter):
+    """merlin.source_preserving v1: bounded native FP32 QK227 contraction."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        if len(inputs) != 2 or any(value is None for value in inputs):
+            raise ValueError("Source QK SGEMM requires two tensor operands")
+        return _source_mkl_sgemm177_call(bb, inputs[0], inputs[1], "qk", 227)
+
+
+class TorchOnednnGemmBf16PV227(OnnxOpConverter):
+    """merlin.source_preserving v1: bounded native BF16 PV227 contraction."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        if len(inputs) != 2 or any(value is None for value in inputs):
+            raise ValueError("Source BF16 PV requires two tensor operands")
+        return _source_onednn_bf16_pv227_call(bb, inputs[0], inputs[1])
 
 
 class TorchSoftmaxAvx512F32LastDim177(OnnxOpConverter):
@@ -4408,13 +4498,26 @@ class TorchSiluAvx512F32(OnnxOpConverter):
         return _source_silu_call(bb, inputs[0])
 
 
+class TorchSoftmaxAvx512F32LastDim227(OnnxOpConverter):
+    """merlin.source_preserving v1: bound SmolVLA CPU FLOAT softmax arithmetic."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        if len(inputs) != 1 or inputs[0] is None:
+            raise ValueError("Source softmax227 requires one tensor operand")
+        return _source_softmax227_call(bb, inputs[0])
+
+
 def _get_convert_map():
     return {
         "TorchSiluAvx512F32": TorchSiluAvx512F32,
         "TorchMean720Fp32": TorchMean720Fp32,
         "TorchMklSgemmF32QK177": TorchMklSgemmF32QK177,
         "TorchMklSgemmF32PV177": TorchMklSgemmF32PV177,
+        "TorchMklSgemmF32QK227": TorchMklSgemmF32QK227,
+        "TorchOnednnGemmBf16PV227": TorchOnednnGemmBf16PV227,
         "TorchSoftmaxAvx512F32LastDim177": TorchSoftmaxAvx512F32LastDim177,
+        "TorchSoftmaxAvx512F32LastDim227": TorchSoftmaxAvx512F32LastDim227,
         "TorchLayerNormAvx2Bf16Width768": TorchLayerNormAvx2Bf16Width768,
         "TorchConv2dAvx512Bf16IC3Kernel16Stride16": TorchConv2dAvx512Bf16IC3Kernel16Stride16,
         "FixedTreeDot": FixedTreeDot,
@@ -4780,8 +4883,8 @@ class ONNXGraphImporter:
                     raise ValueError("Fixed-tree operators require exactly one merlin.fixed_order version 1 import")
                 if node.attribute or len(node.output) != 1:
                     raise ValueError("Fixed-tree operators require no attributes and one output")
-            if op_name in ("TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchLayerNormAvx2Bf16Width768", "TorchConv2dAvx512Bf16IC3Kernel16Stride16", "TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177") or node.domain == "merlin.source_preserving":
-                if node.domain != "merlin.source_preserving" or self._source_preserving_opsets != [1] or op_name not in ("TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchLayerNormAvx2Bf16Width768", "TorchConv2dAvx512Bf16IC3Kernel16Stride16", "TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"):
+            if op_name in ("TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchSoftmaxAvx512F32LastDim227", "TorchLayerNormAvx2Bf16Width768", "TorchConv2dAvx512Bf16IC3Kernel16Stride16", "TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177", "TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227") or node.domain == "merlin.source_preserving":
+                if node.domain != "merlin.source_preserving" or self._source_preserving_opsets != [1] or op_name not in ("TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchSoftmaxAvx512F32LastDim227", "TorchLayerNormAvx2Bf16Width768", "TorchConv2dAvx512Bf16IC3Kernel16Stride16", "TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177", "TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227"):
                     raise ValueError("Source operators require exactly one merlin.source_preserving version 1 import")
                 if node.attribute or len(node.output) != 1:
                     raise ValueError("Source operators require no attributes and one output")
