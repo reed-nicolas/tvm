@@ -21,6 +21,7 @@ ONNX testcases
 This file is a test script to test Relax ONNX frontend coverage.
 """
 
+import math
 from typing import Dict, List, Literal, Optional
 
 import numpy as np
@@ -3434,21 +3435,21 @@ def test_source_sgemm177_refuses_unsupported_contracts(kind, reduction, columns)
             from_onnx(model(**options))
 
 
-@pytest.mark.parametrize("kind,reduction,columns,dtype", [("QK", 64, 227, TensorProto.FLOAT), ("PV", 227, 64, TensorProto.BFLOAT16)])
-def test_source_attention227_static_interface_and_private_scratch(kind, reduction, columns, dtype):
-    opname = "TorchMklSgemmF32QK227" if kind == "QK" else "TorchOnednnGemmBf16PV227"
-    shapes = [(1, 15, 50, reduction), (1, 15, reduction, columns)]
+@pytest.mark.parametrize("kind,queries,reduction,columns,dtype", [("QK", 50, 64, 227, TensorProto.FLOAT), ("PV", 50, 227, 64, TensorProto.BFLOAT16), ("PV", 177, 177, 64, TensorProto.BFLOAT16)])
+def test_source_attention_static_interface_and_private_scratch(kind, queries, reduction, columns, dtype):
+    opname = "TorchMklSgemmF32QK227" if kind == "QK" else f"TorchOnednnGemmBf16PV{reduction}"
+    shapes = [(1, 15, queries, reduction), (1, 15, reduction, columns)]
     inputs = [helper.make_tensor_value_info(name, dtype, shape) for name, shape in zip(("a", "b"), shapes)]
-    output = helper.make_tensor_value_info("y", dtype, (1, 15, 50, columns))
+    output = helper.make_tensor_value_info("y", dtype, (1, 15, queries, columns))
     node = helper.make_node(opname, ["a", "b"], ["y"], domain="merlin.source_preserving")
     model = helper.make_model(helper.make_graph([node], "source_sgemm", inputs, [output]), opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
     imported = from_onnx(model)
     assert imported["main"].ret_struct_info.dtype == ("float32" if kind == "QK" else "bfloat16")
-    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == (1, 15, 50, columns)
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == (1, 15, queries, columns)
     prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith(("torch_mkl_sgemm_", "torch_onednn_gemm_")) and isinstance(func, tvm.tir.PrimFunc))
     assert int(prim.attrs["op_pattern"]) == 8
     buffers = [prim.buffer_map[param] for param in prim.params]
-    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(15 * 50 * reduction,), (15 * reduction * columns,), (15 * 50 * columns,), (1,)]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(15 * queries * reduction,), (15 * reduction * columns,), (15 * queries * columns,), (1,)]
     assert [buffer.dtype for buffer in buffers] == (["float32"] * 4 if kind == "QK" else ["bfloat16"] * 3 + ["float32"])
     assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
     assert '"llvm.fma"' in prim.script()
@@ -3457,18 +3458,18 @@ def test_source_attention227_static_interface_and_private_scratch(kind, reductio
     assert not any(name.name_hint.startswith(("torch_mkl_sgemm_", "torch_onednn_gemm_")) for name in original.functions)
 
 
-@pytest.mark.parametrize("kind,reduction,columns,dtype", [("QK", 64, 227, TensorProto.FLOAT), ("PV", 227, 64, TensorProto.BFLOAT16)])
-def test_source_attention227_refuses_unsupported_contracts(kind, reduction, columns, dtype):
-    opname = "TorchMklSgemmF32QK227" if kind == "QK" else "TorchOnednnGemmBf16PV227"
+@pytest.mark.parametrize("kind,queries,reduction,columns,dtype", [("QK", 50, 64, 227, TensorProto.FLOAT), ("PV", 50, 227, 64, TensorProto.BFLOAT16), ("PV", 177, 177, 64, TensorProto.BFLOAT16)])
+def test_source_attention_refuses_unsupported_contracts(kind, queries, reduction, columns, dtype):
+    opname = "TorchMklSgemmF32QK227" if kind == "QK" else f"TorchOnednnGemmBf16PV{reduction}"
     def model(domain="merlin.source_preserving", versions=(1,), shape_a=None, shape_b=None, dtype=dtype, attributes=None, inputs=("a", "b"), outputs=("y",)):
-        shape_a = (1, 15, 50, reduction) if shape_a is None else shape_a
+        shape_a = (1, 15, queries, reduction) if shape_a is None else shape_a
         shape_b = (1, 15, reduction, columns) if shape_b is None else shape_b
         node = helper.make_node(opname, inputs, outputs, domain=domain, **(attributes or {}))
         infos = [helper.make_tensor_value_info(name, dtype, shape_a if name == "a" else shape_b) for name in inputs if name]
-        graph = helper.make_graph([node], "source_sgemm", infos, [helper.make_tensor_value_info(name, dtype, (1, 15, 50, columns)) for name in outputs])
+        graph = helper.make_graph([node], "source_sgemm", infos, [helper.make_tensor_value_info(name, dtype, (1, 15, queries, columns)) for name in outputs])
         return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
 
-    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"algorithm": "other"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("a",)}, {"inputs": ("a", "")}, {"inputs": ("a", "b", "c")}, {"shape_a": (15, 50, reduction)}, {"shape_a": (1, 15, 49, reduction)}, {"shape_a": (1, 15, 50, reduction + 1)}, {"shape_a": (1, 15, 0, reduction)}, {"shape_a": (1, 15, "N", reduction)}, {"shape_a": ()}, {"shape_a": (1 << 61, 15, 50, reduction)}, {"shape_b": (1, 15, reduction, columns + 1)}, {"shape_b": (1, 14, reduction, columns)}, {"shape_b": (1, 15, "K", columns)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16 if kind == "QK" else TensorProto.FLOAT}]
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"algorithm": "other"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("a",)}, {"inputs": ("a", "")}, {"inputs": ("a", "b", "c")}, {"shape_a": (15, queries, reduction)}, {"shape_a": (1, 15, queries - 1, reduction)}, {"shape_a": (1, 15, queries, reduction + 1)}, {"shape_a": (1, 15, 0, reduction)}, {"shape_a": (1, 15, "N", reduction)}, {"shape_a": ()}, {"shape_a": (1 << 61, 15, queries, reduction)}, {"shape_b": (1, 15, reduction, columns + 1)}, {"shape_b": (1, 14, reduction, columns)}, {"shape_b": (1, 15, "K", columns)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16 if kind == "QK" else TensorProto.FLOAT}]
     for options in invalid:
         with pytest.raises(ValueError):
             from_onnx(model(**options))
@@ -3504,67 +3505,37 @@ def test_source_flash_vision1024_refuses_unsupported_interfaces():
             from_onnx(model(**options))
 
 
-def test_source_softmax177_static_interface_and_private_scratch():
-    """The custom contract exposes private storage while retaining one public output."""
-    shape = (1, 15, 50, 177)
-    node = helper.make_node("TorchSoftmaxAvx512F32LastDim177", ["x"], ["y"], domain="merlin.source_preserving")
-    graph = helper.make_graph([node], "source_softmax177", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
+@pytest.mark.parametrize("width,shape", [(177, (177,)), (177, (7, 177)), (177, (2, 3, 177)), (177, (1, 15, 50, 177)), (177, (1, 15, 177, 177)), (227, (227,)), (227, (2, 3, 227)), (227, (1, 15, 50, 227))])
+def test_source_softmax_static_interface_and_private_scratch(width, shape):
+    """Leading dimensions change row count; the row kernel keeps private scratch."""
+    operator = f"TorchSoftmaxAvx512F32LastDim{width}"
+    node = helper.make_node(operator, ["x"], ["y"], domain="merlin.source_preserving")
+    graph = helper.make_graph([node], "source_softmax", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
     imported = from_onnx(model)
     assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == shape
     assert imported["main"].ret_struct_info.dtype == "float32"
     prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_softmax_avx512_") and isinstance(func, tvm.tir.PrimFunc))
     assert int(prim.attrs["op_pattern"]) == 8
+    rows = math.prod(shape[:-1])
     buffers = list(prim.buffer_map.values())
-    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(750, 177), (750, 177), (209,)]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(rows, width), (rows, width), (width + 32,)]
     assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
-    # Public ordinary Softmax still imports as the ordinary Relax operation.
     ordinary = helper.make_node("Softmax", ["x"], ["y"], axis=-1)
     graph = helper.make_graph([ordinary], "ordinary_softmax", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
     original = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]))
     assert not any(name.name_hint.startswith("torch_softmax_avx512_") for name in original.functions)
 
 
-def test_source_softmax177_refuses_ambiguous_or_unsupported_contracts():
-    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 15, 50, 177), dtype=TensorProto.FLOAT, attributes=None, inputs=("x",), outputs=("y",)):
-        node = helper.make_node("TorchSoftmaxAvx512F32LastDim177", inputs, outputs, domain=domain, **(attributes or {}))
-        graph = helper.make_graph([node], "source_softmax177", [helper.make_tensor_value_info(name, dtype, shape) for name in inputs if name], [helper.make_tensor_value_info(name, dtype, shape) for name in outputs])
+@pytest.mark.parametrize("width", [177, 227])
+def test_source_softmax_refuses_ambiguous_or_unsupported_contracts(width):
+    def model(domain="merlin.source_preserving", versions=(1,), shape=None, dtype=TensorProto.FLOAT, attributes=None, inputs=("x",), outputs=("y",)):
+        shape = (1, 15, 50, width) if shape is None else shape
+        node = helper.make_node(f"TorchSoftmaxAvx512F32LastDim{width}", inputs, outputs, domain=domain, **(attributes or {}))
+        graph = helper.make_graph([node], "source_softmax", [helper.make_tensor_value_info(name, dtype, shape) for name in inputs if name], [helper.make_tensor_value_info(name, dtype, shape) for name in outputs])
         return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
 
-    invalid = [{"domain": ""}, {"domain": "other"}, {"domain": "tvm.contrib.source_preserving"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"axis": -1}}, {"attributes": {"algorithm": "other"}}, {"attributes": {"tvm_custom": "ignored"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("",)}, {"inputs": ("x", "z")}, {"shape": (750, 177)}, {"shape": (2, 15, 50, 177)}, {"shape": (1, 14, 50, 177)}, {"shape": (1, 15, 49, 177)}, {"shape": (1, 15, 50, 176)}, {"shape": (1, 15, 50, 178)}, {"shape": (1, 15, 0, 177)}, {"shape": (1, 15, "N", 177)}, {"shape": ()}, {"shape": (1 << 61, 15, 50, 177)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16}]
-    for options in invalid:
-        with pytest.raises(ValueError):
-            from_onnx(model(**options))
-
-
-def test_source_softmax227_static_interface_and_private_scratch():
-    """The custom contract exposes private storage while retaining one public output."""
-    shape = (1, 15, 50, 227)
-    node = helper.make_node("TorchSoftmaxAvx512F32LastDim227", ["x"], ["y"], domain="merlin.source_preserving")
-    graph = helper.make_graph([node], "source_softmax227", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
-    imported = from_onnx(model)
-    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == shape
-    assert imported["main"].ret_struct_info.dtype == "float32"
-    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_softmax_avx512_") and isinstance(func, tvm.tir.PrimFunc))
-    assert int(prim.attrs["op_pattern"]) == 8
-    buffers = list(prim.buffer_map.values())
-    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(750, 227), (750, 227), (259,)]
-    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
-    # Public ordinary Softmax still imports as the ordinary Relax operation.
-    ordinary = helper.make_node("Softmax", ["x"], ["y"], axis=-1)
-    graph = helper.make_graph([ordinary], "ordinary_softmax", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
-    original = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]))
-    assert not any(name.name_hint.startswith("torch_softmax_avx512_") for name in original.functions)
-
-
-def test_source_softmax227_refuses_ambiguous_or_unsupported_contracts():
-    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 15, 50, 227), dtype=TensorProto.FLOAT, attributes=None, inputs=("x",), outputs=("y",)):
-        node = helper.make_node("TorchSoftmaxAvx512F32LastDim227", inputs, outputs, domain=domain, **(attributes or {}))
-        graph = helper.make_graph([node], "source_softmax227", [helper.make_tensor_value_info(name, dtype, shape) for name in inputs if name], [helper.make_tensor_value_info(name, dtype, shape) for name in outputs])
-        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
-
-    invalid = [{"domain": ""}, {"domain": "other"}, {"domain": "tvm.contrib.source_preserving"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"axis": -1}}, {"attributes": {"algorithm": "other"}}, {"attributes": {"tvm_custom": "ignored"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("",)}, {"inputs": ("x", "z")}, {"shape": (750, 227)}, {"shape": (2, 15, 50, 227)}, {"shape": (1, 14, 50, 227)}, {"shape": (1, 15, 49, 227)}, {"shape": (1, 15, 50, 226)}, {"shape": (1, 15, 50, 228)}, {"shape": (1, 15, 0, 227)}, {"shape": (1, 15, "N", 227)}, {"shape": ()}, {"shape": (1 << 61, 15, 50, 227)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16}]
+    invalid = [{"domain": ""}, {"domain": "other"}, {"domain": "tvm.contrib.source_preserving"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"axis": -1}}, {"attributes": {"algorithm": "other"}}, {"attributes": {"tvm_custom": "ignored"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("",)}, {"inputs": ("x", "z")}, {"shape": (1, 15, 50, width - 1)}, {"shape": (1, 15, 50, width + 1)}, {"shape": (0, width)}, {"shape": (-1, width)}, {"shape": ("N", width)}, {"shape": ()}, {"shape": (1 << 61, width)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16}]
     for options in invalid:
         with pytest.raises(ValueError):
             from_onnx(model(**options))
