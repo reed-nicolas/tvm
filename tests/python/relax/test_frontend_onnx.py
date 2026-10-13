@@ -3472,6 +3472,36 @@ def test_source_attention227_refuses_unsupported_contracts(kind, reduction, colu
             from_onnx(model(**options))
 
 
+def test_source_flash_vision1024_exposes_bounded_private_storage():
+    shape, mask_shape = (1, 12, 1024, 64), (1, 1, 1024, 1024)
+    names = ("q", "k", "v", "mask")
+    node = helper.make_node("TorchFlashBf16Vision1024", names, ["y"], domain="merlin.source_preserving")
+    inputs = [helper.make_tensor_value_info(name, TensorProto.BFLOAT16, mask_shape if name == "mask" else shape) for name in names]
+    graph = helper.make_graph([node], "source_flash", inputs, [helper.make_tensor_value_info("y", TensorProto.BFLOAT16, shape)])
+    imported = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)]))
+    assert imported["main"].ret_struct_info.dtype == "bfloat16"
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == shape
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_flash_cpu_") and isinstance(func, tvm.tir.PrimFunc))
+    buffers = [prim.buffer_map[param] for param in prim.params]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [shape, shape, shape, mask_shape, shape, (180832,), (256, 512)]
+    assert [str(buffer.dtype) for buffer in buffers] == ["bfloat16"] * 5 + ["float32", "bfloat16"]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    assert int(prim.attrs["op_pattern"]) == 8
+
+
+def test_source_flash_vision1024_refuses_unsupported_interfaces():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 12, 1024, 64), mask_shape=(1, 1, 1024, 1024), dtype=TensorProto.BFLOAT16, attributes=None, names=("q", "k", "v", "mask"), outputs=("y",)):
+        node = helper.make_node("TorchFlashBf16Vision1024", names, outputs, domain=domain, **(attributes or {}))
+        inputs = [helper.make_tensor_value_info(name, dtype, mask_shape if name == "mask" else shape) for name in names if name]
+        graph = helper.make_graph([node], "source_flash", inputs, [helper.make_tensor_value_info(name, dtype, shape) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"scale": 0.125}}, {"outputs": ("y", "z")}, {"names": ("q", "k", "v")}, {"names": ("q", "k", "v", "")}, {"dtype": TensorProto.FLOAT}, {"shape": (1, 12, 1024, 63)}, {"shape": (2, 12, 1024, 64)}, {"shape": (1, 12, "N", 64)}, {"mask_shape": (1, 12, 1024, 1024)}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
 def test_source_softmax177_static_interface_and_private_scratch():
     """The custom contract exposes private storage while retaining one public output."""
     shape = (1, 15, 50, 177)

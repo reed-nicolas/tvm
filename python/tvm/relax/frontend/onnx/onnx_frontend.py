@@ -4374,6 +4374,136 @@ def source_mkl_sgemm(A:T.Buffer((T.int64({left_count}),),'float32'), B:T.Buffer(
     return relax.op.reshape(result, (1, 15, 50, columns))
 
 
+def _source_flash_vision1024_call(bb, query, key, value, mask):
+    """Pinned finite vision Flash arithmetic with source-proved positive-zero masks.
+
+    The exporter authenticates the original mask DAG, native layout and runtime.
+    This is a bounded source profile, not general masked SDPA. The kernel retains
+    FP32 sums before BF16 probability stores and the installed 256+256 PV order.
+    Its expf dependency is host-library bound; target equivalence is unqualified.
+    Both workspaces are visible outputs and reused serially across heads/tiles.
+    """
+    from tvm.script import tir as T  # pylint: disable=import-outside-toplevel
+
+    expected = [(1, 12, 1024, 64)] * 3 + [(1, 1, 1024, 1024)]
+    operands = [query, key, value, mask]
+    for operand, required in zip(operands, expected):
+        info = getattr(operand, "struct_info", None)
+        if not isinstance(info, relax.TensorStructInfo) or info.dtype != "bfloat16" or not isinstance(info.shape, relax.ShapeExpr):
+            raise ValueError("Source Flash requires static BF16 tensors")
+        if any(not isinstance(dim, tir.IntImm) for dim in info.shape.values) or tuple(int(dim) for dim in info.shape.values) != required:
+            raise ValueError("Source Flash requires the admitted vision geometry")
+    def widen(expression):
+        return f"T.reinterpret('float32',T.shift_left(T.Cast('uint32',T.reinterpret('uint16',{expression})),T.uint32(16)))"
+
+    # QK0..131071; row maxima131072; sums131328; dst131584;
+    # two reduction vectors147968; GEMM widening148000; PV dot180768.
+    source = f"""@T.prim_func
+def source_flash(Q:T.Buffer((T.int64(1),T.int64(12),T.int64(1024),T.int64(64)), 'bfloat16'), K:T.Buffer((T.int64(1),T.int64(12),T.int64(1024),T.int64(64)), 'bfloat16'), V:T.Buffer((T.int64(1),T.int64(12),T.int64(1024),T.int64(64)), 'bfloat16'), Mask:T.Buffer((T.int64(1),T.int64(1),T.int64(1024),T.int64(1024)), 'bfloat16'), Y:T.Buffer((T.int64(1),T.int64(12),T.int64(1024),T.int64(64)), 'bfloat16'), F:T.Buffer((T.int64(180832),), 'float32'), P:T.Buffer((T.int64(256),T.int64(512)), 'bfloat16')):
+    T.func_attr({{'tir.noalias':True,'op_pattern':8}})
+    with T.block('root'):
+        for head,query_tile in T.grid(T.int64(12),T.int64(4)):
+            for row in range(T.int64(256)):
+                F[131072+row]=T.reinterpret('float32',T.uint32(0xff800000))
+                F[131328+row]=T.float32(0)
+            for key_tile in range(T.int64(2)):
+                for inner,col in T.grid(T.int64(64),T.int64(512)):
+                    F[148000+inner*512+col]={widen('K[0,head,key_tile*512+col,inner]')}
+                for row,group in T.grid(T.int64(256),T.int64(32)):
+                    for lane in T.vectorized(T.int64(16)):
+                        F[row*512+group*16+lane]=T.float32(0)
+                    for inner in range(T.int64(64)):
+                        q={widen('Q[0,head,query_tile*256+row,inner]')}
+                        for lane in T.vectorized(T.int64(16)):
+                            F[row*512+group*16+lane]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),q,F[148000+inner*512+group*16+lane],F[row*512+group*16+lane])
+                for row in range(T.int64(256)):
+                    for col in range(T.int64(512)):
+                        mask={widen('Mask[0,0,query_tile*256+row,key_tile*512+col]')}
+                        F[row*512+col]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),F[row*512+col],T.float32(.125),mask)
+                    for lane in range(T.int64(16)):
+                        F[147968+lane]=F[row*512+lane]
+                    for group,lane in T.grid(T.int64(31),T.int64(16)):
+                        value=F[row*512+(group+1)*16+lane]
+                        F[147968+lane]=T.if_then_else(F[147968+lane]>value,F[147968+lane],value)
+                    for stage in T.unroll(T.int64(4)):
+                        stride=T.shift_right(T.int64(8),stage)
+                        for lane in range(T.int64(16)):
+                            other=F[147968+T.bitwise_xor(lane,stride)]
+                            F[147984+lane]=T.if_then_else(F[147968+lane]>other,F[147968+lane],other)
+                        for lane in range(T.int64(16)):
+                            F[147968+lane]=F[147984+lane]
+                    maximum=T.if_then_else(F[131072+row]>F[147968],F[131072+row],F[147968])
+                    for lane in range(T.int64(16)):
+                        F[147968+lane]=T.float32(0)
+                    for group,lane in T.grid(T.int64(32),T.int64(16)):
+                        col=group*16+lane
+                        delta=F[row*512+col]-maximum
+                        src=delta*T.reinterpret('float32',T.uint32(0x3fb8aa3b))
+                        fractional=src-T.floor(src)
+                        p0=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),fractional,T.reinterpret('float32',T.uint32(0xbda235d5)),T.reinterpret('float32',T.uint32(0xbe65b8f5)))
+                        p1=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),fractional,p0,T.reinterpret('float32',T.uint32(0x3e9b69f0)))
+                        p2=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),fractional,p1,T.reinterpret('float32',T.uint32(0x38e077a1)))
+                        corrected=src-p2
+                        affine=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),T.reinterpret('float32',T.uint32(0x4b000000)),corrected,T.reinterpret('float32',T.uint32(0x4e7e0000)))
+                        encoded=T.if_then_else(delta<T.reinterpret('float32',T.uint32(0xc2aeac50)),T.uint32(0),T.Cast('uint32',T.Cast('int32',affine)))
+                        exponential=T.reinterpret('float32',encoded)
+                        F[147968+lane]=F[147968+lane]+exponential
+                        narrowed=T.Cast('uint16',T.shift_right(encoded+T.uint32(0x7fff)+T.bitwise_and(T.shift_right(encoded,T.uint32(16)),T.uint32(1)),T.uint32(16)))
+                        P[row,col]=T.reinterpret('bfloat16',narrowed)
+                    for stage in T.unroll(T.int64(4)):
+                        stride=T.shift_right(T.int64(8),stage)
+                        for lane in range(T.int64(16)):
+                            F[147984+lane]=F[147968+lane]+F[147968+T.bitwise_xor(lane,stride)]
+                        for lane in range(T.int64(16)):
+                            F[147968+lane]=F[147984+lane]
+                    old_rescale=T.call_extern('float32','expf',F[131072+row]-maximum)
+                    F[131328+row]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),old_rescale,F[131328+row],F[147968])
+                    F[131072+row]=maximum
+                    if key_tile>0:
+                        for col in range(T.int64(64)):
+                            F[131584+row*64+col]=F[131584+row*64+col]*old_rescale
+                for inner,col in T.grid(T.int64(512),T.int64(64)):
+                    F[148000+inner*64+col]={widen('V[0,head,key_tile*512+inner,col]')}
+                for row in range(T.int64(256)):
+                    # Installed nocopy NN K512 driver partitions256+256.
+                    # Each chunk starts+0; beta1 adds existing D only after its dot.
+                    for chunk,group in T.grid(T.int64(2),T.int64(4)):
+                        for lane in T.vectorized(T.int64(16)):
+                            F[180768+group*16+lane]=T.float32(0)
+                        for inner in range(T.int64(256)):
+                            probability={widen('P[row,chunk*256+inner]')}
+                            for lane in T.vectorized(T.int64(16)):
+                                F[180768+group*16+lane]=T.call_llvm_pure_intrin('float32','llvm.fma',T.uint32(3),probability,F[148000+(chunk*256+inner)*64+group*16+lane],F[180768+group*16+lane])
+                        for lane in T.vectorized(T.int64(16)):
+                            if key_tile==0 and chunk==0:
+                                F[131584+row*64+group*16+lane]=F[180768+group*16+lane]
+                            else:
+                                F[131584+row*64+group*16+lane]=F[180768+group*16+lane]+F[131584+row*64+group*16+lane]
+            for row in range(T.int64(256)):
+                denominator=T.if_then_else(F[131328+row]==T.float32(0),T.float32(1),F[131328+row])
+                reciprocal=T.float32(1)/denominator
+                for col in range(T.int64(64)):
+                    product=F[131584+row*64+col]*reciprocal
+                    word=T.reinterpret('uint32',product)
+                    narrowed=T.Cast('uint16',T.shift_right(word+T.uint32(0x7fff)+T.bitwise_and(T.shift_right(word,T.uint32(16)),T.uint32(1)),T.uint32(16)))
+                    Y[0,head,query_tile*256+row,col]=T.reinterpret('bfloat16',narrowed)
+"""
+    prim = tvm.script.from_source(source, extra_vars={'T': T}).without_attr('global_symbol')
+    kernel = bb.add_func(prim, "torch_flash_cpu_bf16_vision1024_v1")
+    outputs = [relax.TensorStructInfo((1, 12, 1024, 64), "bfloat16"), relax.TensorStructInfo((180832,), "float32"), relax.TensorStructInfo((256, 512), "bfloat16")]
+    return bb.normalize(relax.TupleGetItem(bb.emit(relax.call_tir(kernel, operands, outputs)), 0))
+
+
+class TorchFlashBf16Vision1024(OnnxOpConverter):
+    """merlin.source_preserving v1: original finite, zero-mask vision Flash."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        if len(inputs) != 4 or any(operand is None for operand in inputs):
+            raise ValueError("Source Flash requires original Q/K/V and positive-zero mask")
+        return _source_flash_vision1024_call(bb, *inputs)
+
+
 class TorchMklSgemmF32QK177(OnnxOpConverter):
     """merlin.source_preserving v1: bounded native FP32 QK contraction."""
 
@@ -4512,6 +4642,7 @@ def _get_convert_map():
     return {
         "TorchSiluAvx512F32": TorchSiluAvx512F32,
         "TorchMean720Fp32": TorchMean720Fp32,
+        "TorchFlashBf16Vision1024": TorchFlashBf16Vision1024,
         "TorchMklSgemmF32QK177": TorchMklSgemmF32QK177,
         "TorchMklSgemmF32PV177": TorchMklSgemmF32PV177,
         "TorchMklSgemmF32QK227": TorchMklSgemmF32QK227,
@@ -4883,8 +5014,8 @@ class ONNXGraphImporter:
                     raise ValueError("Fixed-tree operators require exactly one merlin.fixed_order version 1 import")
                 if node.attribute or len(node.output) != 1:
                     raise ValueError("Fixed-tree operators require no attributes and one output")
-            if op_name in ("TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchSoftmaxAvx512F32LastDim227", "TorchLayerNormAvx2Bf16Width768", "TorchConv2dAvx512Bf16IC3Kernel16Stride16", "TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177", "TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227") or node.domain == "merlin.source_preserving":
-                if node.domain != "merlin.source_preserving" or self._source_preserving_opsets != [1] or op_name not in ("TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchSoftmaxAvx512F32LastDim227", "TorchLayerNormAvx2Bf16Width768", "TorchConv2dAvx512Bf16IC3Kernel16Stride16", "TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177", "TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227"):
+            if op_name in ("TorchFlashBf16Vision1024", "TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchSoftmaxAvx512F32LastDim227", "TorchLayerNormAvx2Bf16Width768", "TorchConv2dAvx512Bf16IC3Kernel16Stride16", "TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177", "TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227") or node.domain == "merlin.source_preserving":
+                if node.domain != "merlin.source_preserving" or self._source_preserving_opsets != [1] or op_name not in ("TorchFlashBf16Vision1024", "TorchSiluAvx512F32", "TorchMean720Fp32", "TorchSoftmaxAvx512F32LastDim177", "TorchSoftmaxAvx512F32LastDim227", "TorchLayerNormAvx2Bf16Width768", "TorchConv2dAvx512Bf16IC3Kernel16Stride16", "TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177", "TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227"):
                     raise ValueError("Source operators require exactly one merlin.source_preserving version 1 import")
                 if node.attribute or len(node.output) != 1:
                     raise ValueError("Source operators require no attributes and one output")
